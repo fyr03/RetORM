@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
 import logging
+import random
 import textwrap
 import threading
 import time
@@ -45,7 +46,7 @@ from db.connector import (
     init_database, create_tables, drop_tables,
     execute_sql, dispose_engine,
 )
-from ir.nodes import pretty_print
+from ir.nodes import pretty_print, Scan, Filter, Join, GroupBy, Having, Project
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +129,7 @@ class _StatsPrinter(threading.Thread):
             f"[运行统计]  耗时={elapsed}s  速度={qpm} q/min , 查询总数  : {total}",
             f"  通过      : {s.passed}  ({pass_rate}),  空结果    : {s.empty_results}  ({empty_rate}),  执行错误  : {s.errors}  ({error_rate})",
             f"  SQL bug   : {s.sql_bugs},  ORM bug   : {s.orm_bugs},  bug 合计  : {bug_total}  ({bug_rate})",
+            f"  结构覆盖  : 单表={s.single_table_queries}, Join={s.join_queries}, Filter={s.filter_queries}, GroupBy={s.groupby_queries}, Having={s.having_queries}, 重复投影={s.duplicate_proj_queries}",
         ]
         for line in lines:
             self.run_logger.info(line)
@@ -142,9 +144,14 @@ class BugReport:
     schema_id:    int
     query_id:     int
     schema:       object          # Schema 对象，用于生成复现代码
+    ir:           object          # 原始 IR 对象，用于稳定复现
     ir_str:       str
     schema_seed:  int
     query_seed:   int
+    table_data:   dict            # 原始插入数据，避免复现时重新随机生成
+    rows_per_table: int
+    use_z3:       bool
+    z3_timeout:   int
     ref_vs_sql:   object          # CompareResult
     ref_vs_orm:   object          # CompareResult
     ref_rows:     list
@@ -162,6 +169,12 @@ class RunStats:
     orm_bugs:      int = 0
     errors:        int = 0
     empty_results: int = 0
+    single_table_queries:   int = 0
+    join_queries:           int = 0
+    filter_queries:         int = 0
+    groupby_queries:        int = 0
+    having_queries:         int = 0
+    duplicate_proj_queries: int = 0
     bug_reports:   List[BugReport] = field(default_factory=list)
 
 
@@ -225,6 +238,9 @@ def _write_bug_detail(report: BugReport) -> str:
         f"原因       : {reason}",
         f"Schema seed: {report.schema_seed}",
         f"Query  seed: {report.query_seed}",
+        f"rows/table : {report.rows_per_table}",
+        f"use_z3     : {report.use_z3}",
+        f"z3_timeout : {report.z3_timeout}s",
         sep,
         "",
         "── Schema（建表 SQL）──",
@@ -237,6 +253,15 @@ def _write_bug_detail(report: BugReport) -> str:
         "── IR 树 ──",
         report.ir_str,
         "",
+        "── 原始插入数据 ──",
+    ]
+    for table in report.schema.tables:
+        rows = report.table_data.get(table.name, [])
+        lines.append(f"  {table.name} ({len(rows)} 行): {rows}")
+    lines.append("")
+
+    lines += [
+        "── Raw SQL（路径二）──",
     ]
 
     # Raw SQL
@@ -244,21 +269,11 @@ def _write_bug_detail(report: BugReport) -> str:
         sql_str = report.sql_text
     else:
         try:
-            from generator.schema_gen import generate_schema
-            from generator.ir_gen import generate_ir
-            _schema = generate_schema(
-                num_tables=len(report.schema.tables),
-                cols_per_table=max(len(t.non_pk_columns()) - len(t.fks)
-                                   for t in report.schema.tables),
-                fk_prob=0.6, seed=report.schema_seed,
-            )
-            _ir, _ = generate_ir(_schema, seed=report.query_seed)
-            sql_str = sql_translate(_ir)
+            sql_str = sql_translate(report.ir)
         except Exception as e:
             sql_str = f"（生成失败: {e}）"
 
     lines += [
-        "── Raw SQL（路径二）──",
         sql_str,
         "",
         "── ORM API（路径三：SQLAlchemy Core）──",
@@ -343,9 +358,9 @@ def _write_bug_file(report: BugReport, bug_dir: str, bug_idx: int) -> str:
     create_sqls = generate_create_sqls(report.schema)
     drop_order  = generate_drop_sqls(report.schema)
 
-    # ── 生成 INSERT 语句（从 ref_rows 反推，或重新生成数据）──
-    # 这里用 schema_seed + query_seed 重新生成，保证复现
-    insert_code = _gen_insert_code(report.schema, report.query_seed)
+    # ── 直接保存原始插入数据和原始 IR，避免复现依赖后续生成器行为 ──
+    insert_code = _gen_insert_code(report.schema, report.table_data)
+    ir_code = _gen_ir_code(report.ir)
 
     # ── 复现脚本 ──
     repro_script = textwrap.dedent(f"""\
@@ -359,6 +374,9 @@ def _write_bug_file(report: BugReport, bug_dir: str, bug_idx: int) -> str:
     Query  ID  : {report.query_id + 1}
     Schema seed: {report.schema_seed}
     Query  seed: {report.query_seed}
+    rows/table : {report.rows_per_table}
+    use_z3     : {report.use_z3}
+    z3_timeout : {report.z3_timeout}s
 
     运行方式：
         conda activate retorm
@@ -366,10 +384,10 @@ def _write_bug_file(report: BugReport, bug_dir: str, bug_idx: int) -> str:
     \"\"\"
 
     import sys, os
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
     from db.connector import (
-        init_database, create_tables, drop_tables, execute_sql,
+        init_database, create_tables, drop_tables, insert_rows,
     )
     from translators.python_ref     import execute as ref_execute
     from translators.sql            import execute as sql_execute, translate as sql_translate
@@ -387,17 +405,8 @@ def _write_bug_file(report: BugReport, bug_dir: str, bug_idx: int) -> str:
     {insert_code}
 
     # ── 3. 构造 IR ──────────────────────────────────────────────────────────
-    # （直接从随机生成器重现，seed 固定保证一致）
-    from generator.schema_gen import generate_schema
-    from generator.ir_gen     import generate_ir
-
-    schema = generate_schema(
-        num_tables={len(report.schema.tables)},
-        cols_per_table={max(len(t.non_pk_columns()) - len(t.fks) for t in report.schema.tables)},
-        fk_prob=0.6,
-        seed={report.schema_seed},
-    )
-    ir, ctx = generate_ir(schema, seed={report.query_seed})
+    # 直接使用 bug 发现时捕获的 IR，避免后续生成器变化导致复现失真
+    ir = {ir_code}
 
     print("IR 树：")
     from ir.nodes import pretty_print
@@ -431,22 +440,70 @@ def _write_bug_file(report: BugReport, bug_dir: str, bug_idx: int) -> str:
     return fpath
 
 
-def _gen_insert_code(schema, query_seed: int) -> str:
-    """生成插入数据的代码片段（直接调用 generate_and_insert 重现数据）。"""
-    return textwrap.dedent(f"""\
-    from generator.schema_gen import generate_schema, generate_create_sqls, generate_drop_sqls
-    from generator.ir_gen     import generate_ir
-    from generator.data_gen   import generate_and_insert
+def _gen_insert_code(schema, table_data: dict) -> str:
+    """生成插入真实原始数据的代码片段，避免复现时重新随机生成。"""
+    lines = []
+    for tname in reversed(generate_drop_sqls(schema)):
+        rows = table_data.get(tname, [])
+        if not rows:
+            continue
+        table = schema.get_table(tname)
+        cols = [c.name for c in table.columns]
+        values = [tuple(row[c] for c in cols) for row in rows]
+        lines.append(f"insert_rows({tname!r}, {cols!r}, {values!r})")
+    return "\n".join(lines) if lines else "pass"
 
-    _schema = generate_schema(
-        num_tables={len(schema.tables)},
-        cols_per_table={max(len(t.non_pk_columns()) - len(t.fks) for t in schema.tables)},
-        fk_prob=0.6,
-        seed={query_seed},   # 用 query_seed 重现同样的数据
-    )
-    _ir, _ = generate_ir(_schema, seed={query_seed})
-    generate_and_insert(_schema, _ir, rows_per_table=10, use_z3=False, seed={query_seed})
-    """)
+
+def _gen_ir_code(node) -> str:
+    """把当前 IR 对象序列化为可直接执行的 Python 构造代码。"""
+    from ir.nodes import Scan, Filter, Join, GroupBy, Having, Project
+    from ir.nodes import Compare, And, Or, Not, Aggregate
+
+    if isinstance(node, Scan):
+        return f"Scan(table={node.table!r}, alias={node.alias!r})"
+    if isinstance(node, Filter):
+        return (
+            f"Filter(condition={_gen_ir_code(node.condition)}, "
+            f"child={_gen_ir_code(node.child)})"
+        )
+    if isinstance(node, Join):
+        return (
+            f"Join(left={_gen_ir_code(node.left)}, "
+            f"right={_gen_ir_code(node.right)}, "
+            f"on={_gen_ir_code(node.on)}, "
+            f"join_type=JoinType.{node.join_type.name})"
+        )
+    if isinstance(node, GroupBy):
+        aggs = ", ".join(_gen_ir_code(agg) for agg in node.aggregates)
+        return (
+            f"GroupBy(fields={node.fields!r}, "
+            f"aggregates=[{aggs}], "
+            f"child={_gen_ir_code(node.child)})"
+        )
+    if isinstance(node, Having):
+        return (
+            f"Having(condition={_gen_ir_code(node.condition)}, "
+            f"child={_gen_ir_code(node.child)})"
+        )
+    if isinstance(node, Project):
+        return f"Project(fields={node.fields!r}, child={_gen_ir_code(node.child)})"
+    if isinstance(node, Compare):
+        return (
+            f"Compare(field={node.field!r}, op=CmpOp.{node.op.name}, "
+            f"value={node.value!r})"
+        )
+    if isinstance(node, And):
+        return f"And(left={_gen_ir_code(node.left)}, right={_gen_ir_code(node.right)})"
+    if isinstance(node, Or):
+        return f"Or(left={_gen_ir_code(node.left)}, right={_gen_ir_code(node.right)})"
+    if isinstance(node, Not):
+        return f"Not(child={_gen_ir_code(node.child)})"
+    if isinstance(node, Aggregate):
+        return (
+            f"Aggregate(func=AggFunc.{node.func.name}, "
+            f"field={node.field!r}, alias={node.alias!r})"
+        )
+    raise TypeError(f"不支持序列化的 IR 节点: {type(node)}")
 
 
 # ---------------------------------------------------------------------------
@@ -545,17 +602,24 @@ def run(
             for query_id in range(queries_per_schema):
                 query_seed = schema_seed + query_id + 1
                 stats.total_queries += 1
+                table_data = {}
+                stress_mode = _choose_stress_mode(query_seed)
 
-                prefix = f"\n  Query {query_id + 1}/{queries_per_schema}  (seed={query_seed})"
+                prefix = (
+                    f"\n  Query {query_id + 1}/{queries_per_schema}  "
+                    f"(seed={query_seed}, mode={stress_mode})"
+                )
                 print(prefix, end="  ")
                 # 3. 生成 IR
                 try:
-                    ir, ctx = generate_ir(schema, seed=query_seed)
+                    ir, ctx = generate_ir(schema, stress_mode=stress_mode, seed=query_seed)
                 except Exception as e:
                     msg = f"[IR生成失败] {e}"
                     print(msg); dlog(msg)
                     stats.errors += 1
                     continue
+
+                _record_query_shape(stats, ir)
 
                 ir_str = pretty_print(ir)
                 if verbose:
@@ -566,7 +630,7 @@ def run(
                 # 4. 生成数据
                 try:
                     _truncate_schema(schema)
-                    generate_and_insert(
+                    table_data = generate_and_insert(
                         schema, ir,
                         rows_per_table=config.RANDOM_ROWS,
                         use_z3=use_z3,
@@ -606,8 +670,12 @@ def run(
                     bug_idx += 1
                     report = BugReport(
                         schema_id=schema_id, query_id=query_id,
-                        schema=schema, ir_str=ir_str,
+                        schema=schema, ir=ir, ir_str=ir_str,
                         schema_seed=schema_seed, query_seed=query_seed,
+                        table_data=table_data,
+                        rows_per_table=config.RANDOM_ROWS,
+                        use_z3=use_z3,
+                        z3_timeout=config.Z3_TIMEOUT_SEC,
                         ref_vs_sql=None, ref_vs_orm=None,
                         ref_rows=[], sql_rows=[], orm_rows=[],
                         error=str(e),
@@ -672,8 +740,12 @@ def run(
                     bug_idx += 1
                     report = BugReport(
                         schema_id=schema_id, query_id=query_id,
-                        schema=schema, ir_str=ir_str,
+                        schema=schema, ir=ir, ir_str=ir_str,
                         schema_seed=schema_seed, query_seed=query_seed,
+                        table_data=table_data,
+                        rows_per_table=config.RANDOM_ROWS,
+                        use_z3=use_z3,
+                        z3_timeout=config.Z3_TIMEOUT_SEC,
                         ref_vs_sql=ref_vs_sql, ref_vs_orm=ref_vs_orm,
                         ref_rows=ref_rows, sql_rows=sql_rows, orm_rows=orm_rows,
                         sql_text=sql_text,
@@ -729,6 +801,12 @@ def run(
     run_logger.info(f"  SQL bug   : {s.sql_bugs}")
     run_logger.info(f"  ORM bug   : {s.orm_bugs}  ← 重点关注")
     run_logger.info(f"  bug 合计  : {s.sql_bugs + s.orm_bugs}")
+    run_logger.info(
+        "  结构覆盖  : "
+        f"单表={s.single_table_queries}  Join={s.join_queries}  "
+        f"Filter={s.filter_queries}  GroupBy={s.groupby_queries}  "
+        f"Having={s.having_queries}  重复投影={s.duplicate_proj_queries}"
+    )
     if s.bug_reports:
         run_logger.info(f"  复现脚本  : {bug_dir}/")
         run_logger.info(f"  bug详情   : logs_bug/<bug_ts>.log")
@@ -747,6 +825,82 @@ def _truncate_schema(schema: Schema) -> None:
         execute_sql(f"TRUNCATE TABLE `{tname}`;")
 
 
+def _choose_stress_mode(query_seed: int) -> str:
+    """基于 query_seed 可复现地选择一个压力模式。"""
+    rng = random.Random(query_seed ^ 0x5F3759DF)
+    roll = rng.random()
+    if roll < 0.45:
+        return "balanced"
+    if roll < 0.65:
+        return "join_heavy"
+    if roll < 0.8:
+        return "groupby_heavy"
+    if roll < 0.92:
+        return "duplicate_column_heavy"
+    return "null_heavy"
+
+
+def _record_query_shape(stats: RunStats, ir) -> None:
+    features = _collect_query_features(ir)
+
+    if features["has_join"]:
+        stats.join_queries += 1
+    else:
+        stats.single_table_queries += 1
+
+    if features["has_filter"]:
+        stats.filter_queries += 1
+    if features["has_groupby"]:
+        stats.groupby_queries += 1
+    if features["has_having"]:
+        stats.having_queries += 1
+    if features["has_duplicate_projection"]:
+        stats.duplicate_proj_queries += 1
+
+
+def _collect_query_features(node) -> dict:
+    features = {
+        "has_join": False,
+        "has_filter": False,
+        "has_groupby": False,
+        "has_having": False,
+        "has_duplicate_projection": False,
+    }
+
+    def visit(cur):
+        if isinstance(cur, Join):
+            features["has_join"] = True
+            visit(cur.left)
+            visit(cur.right)
+            return
+        if isinstance(cur, Filter):
+            features["has_filter"] = True
+            visit(cur.child)
+            return
+        if isinstance(cur, GroupBy):
+            features["has_groupby"] = True
+            visit(cur.child)
+            return
+        if isinstance(cur, Having):
+            features["has_having"] = True
+            visit(cur.child)
+            return
+        if isinstance(cur, Project):
+            short_names = [_short_field_name(field) for field in cur.fields]
+            features["has_duplicate_projection"] = len(short_names) != len(set(short_names))
+            visit(cur.child)
+            return
+        if isinstance(cur, Scan):
+            return
+
+    visit(node)
+    return features
+
+
+def _short_field_name(field_name: str) -> str:
+    return field_name.split(".", 1)[1] if "." in field_name else field_name
+
+
 def _print_final_report(stats: RunStats, bug_dir: str = "bugs") -> None:
     print("\n" + "=" * 60)
     print("测试完成")
@@ -756,6 +910,13 @@ def _print_final_report(stats: RunStats, bug_dir: str = "bugs") -> None:
     print(f"  执行错误    : {stats.errors}")
     print(f"  SQL 翻译 bug: {stats.sql_bugs}")
     print(f"  ORM bug     : {stats.orm_bugs}  ← 重点关注")
+    print("  结构覆盖    :")
+    print(f"    单表      : {stats.single_table_queries}")
+    print(f"    Join      : {stats.join_queries}")
+    print(f"    Filter    : {stats.filter_queries}")
+    print(f"    GroupBy   : {stats.groupby_queries}")
+    print(f"    Having    : {stats.having_queries}")
+    print(f"    重复投影  : {stats.duplicate_proj_queries}")
     print("=" * 60)
 
     if not stats.bug_reports:

@@ -16,6 +16,7 @@ comparator/compare.py
 """
 
 import math
+import re
 import sys
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
@@ -37,7 +38,13 @@ NormRows = List[NormRow]
 # 公共配置
 # ---------------------------------------------------------------------------
 
-FLOAT_TOLERANCE = 1e-6   # 浮点数比较容差
+FLOAT_TOLERANCE      = 1e-6   # 普通浮点比较容差
+AGG_FLOAT_TOLERANCE  = 1e-4   # 聚合函数结果容差（MySQL AVG 只保留4位小数）
+
+# MySQL AVG 返回的 Decimal 只有4位小数精度（如 7.3333），
+# 而 Python 用完整 float 精度计算（7.333333...），
+# 两者差值约为 3e-5，需要用更宽松的容差。
+# 识别方式：Decimal 类型说明值来自 MySQL 聚合，用宽松容差。
 
 
 # ---------------------------------------------------------------------------
@@ -117,57 +124,99 @@ def normalize(rows: Rows) -> NormRows:
 
 
 def _normalize_row(row: Row) -> NormRow:
+    """
+    规范化一行数据的列名和值。
+
+    冲突处理：如果同一行里多个字段规范化后得到同一个短名，
+    就按“第几次出现”补上稳定编号，避免覆盖，也避免三条路径因为
+    原始列名格式不同而无法对齐。
+
+    例：
+      ref 路径: {'o.id': 1, 'u.id': 2}
+      sql 路径: {'id': 1, 'u.id': 2}
+      orm 路径: {'o_id': 1, 'u_id': 2}
+
+    三者都会规范化为:
+      {'id#1': 1, 'id#2': 2}
+    """
+    # 第一遍：按原始列顺序收集规范化短名，并统计出现次数
+    norm_keys_in_order: List[str] = []
+    norm_key_count: Dict[str, int] = {}
+    for key in row.keys():
+        nk = _normalize_key(key)
+        norm_keys_in_order.append(nk)
+        norm_key_count[nk] = norm_key_count.get(nk, 0) + 1
+
+    # 第二遍：重复短名按出现次序编号，唯一短名保持不变
     result = {}
-    for key, val in row.items():
-        norm_key = _normalize_key(key)
+    seen_count: Dict[str, int] = {}
+    for (key, val), norm_key in zip(row.items(), norm_keys_in_order):
         norm_val = _normalize_value(val)
-        result[norm_key] = norm_val
+        if norm_key_count[norm_key] > 1:
+            seen_count[norm_key] = seen_count.get(norm_key, 0) + 1
+            canonical_key = f"{norm_key}#{seen_count[norm_key]}"
+        else:
+            canonical_key = norm_key
+        result[canonical_key] = norm_val
     return result
+
+
+# 别名前缀模式：1个字母 + 可选数字，如 o / p / p2 / u3
+_ALIAS_PREFIX_RE = re.compile(r'^([a-zA-Z]\d*)_(.+)$')
 
 
 def _normalize_key(key: str) -> str:
     """
     把列名统一成不带表前缀的短名。
 
-    三条路径的列名格式各不同：
-      ref 路径  : "o.price"  （带表别名前缀，以 "." 分隔）
-      sql 路径  : "price"    （MySQL 返回原始列名）
-                  "p.id"     （两表都有 id 时 MySQL 保留前缀，仍含 "."）
-      orm 路径  : "o_price"  （IR label 里把 "." 替换成 "_"）
-                  "id_1"     （旧版自动重命名，已修复，保留兼容）
+    三条路径的列名格式：
+      ref 路径  : "o.price"   带 "." 的表别名前缀
+                  "p2.num"    双字符别名（字母+数字）
+      sql 路径  : "price"     MySQL 原始列名
+                  "p2.num"    两表同名列时 MySQL 保留前缀
+      orm 路径  : "o_price"   label 把 "." 替换成 "_"（单字母别名）
+                  "p2_num"    双字符别名（字母+数字）
 
     统一规则：
-      1. 含 "."  → 取最后一段（去掉表前缀）
-      2. 含 "_"  → 如果形如 "alias_colname"（首段是单字母），去掉首段
-                   否则保持原样（如 "products_id" 是真实列名，不动）
-      3. 其余    → 原样返回
+      1. 含 "."  → 取最后一段
+      2. 含 "_"  → 首段匹配 "字母+可选数字"（如 o/p/p2/u3）→ 去掉首段
+                   否则保持原样（products_id / count_all 等真实列名不动）
     """
-    # 规则 1：含 "."（ref 路径的 "o.price"，sql 路径的 "p.id"）
+    # 规则 1：含 "."
     if "." in key:
         return key.split(".", 1)[1]
 
-    # 规则 2：orm 路径的 label 把 "." 替换成 "_"，如 "o_price" → "price"
-    # 判断条件：第一个 "_" 前只有单个字母（表别名通常是单字母）
+    # 规则 2：orm label 格式，首段是"字母+可选数字"的别名
     if "_" in key:
-        parts = key.split("_", 1)
-        if len(parts[0]) == 1 and parts[0].isalpha():
-            return parts[1]
+        m = _ALIAS_PREFIX_RE.match(key)
+        if m:
+            return m.group(2)
 
     return key
+
+
+class AggFloat(float):
+    """
+    标记"来自数据库聚合函数（AVG/SUM等）的浮点数"。
+    用于在 _values_equal 里使用更宽松的容差。
+    MySQL AVG 只保留4位小数，Python 保留完整精度，差值约 3e-5。
+    """
+    pass
 
 
 def _normalize_value(val: Any) -> Any:
     """
     统一值类型：
-      Decimal → float
-      bool    → int（Python 里 True/False 是 1/0，但列名语义上应当是整数）
+      Decimal → AggFloat（标记为聚合结果，使用宽松容差）
+      bool    → int
       NaN     → None
       其余保持不变
     """
     if val is None:
         return None
     if isinstance(val, Decimal):
-        return float(val)
+        # 用 AggFloat 而不是普通 float，以便比较时用宽松容差
+        return AggFloat(val)
     if isinstance(val, bool):
         return int(val)
     if isinstance(val, float) and math.isnan(val):
@@ -260,7 +309,8 @@ def _values_equal(a: Any, b: Any) -> bool:
     """
     比较两个值是否语义相等。
     - None == None → True
-    - float/Decimal 用容差比较
+    - AggFloat（来自 Decimal）用宽松容差（MySQL AVG 精度损失约 3e-5）
+    - 普通 float/int 用严格容差
     - 其余用 ==
     """
     # 两者都是 None
@@ -271,12 +321,21 @@ def _values_equal(a: Any, b: Any) -> bool:
     if a is None or b is None:
         return False
 
-    # 数值类型：用容差比较
+    # bool 精确比较（bool 是 int 的子类，要先判断）
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a == b
+
+    # 数值类型
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-        if isinstance(a, bool) or isinstance(b, bool):
-            # bool 用精确比较
-            return a == b
-        return math.isclose(float(a), float(b), rel_tol=FLOAT_TOLERANCE, abs_tol=FLOAT_TOLERANCE)
+        fa, fb = float(a), float(b)
+        # 任一方是 AggFloat（来自 Decimal 聚合结果），用宽松容差
+        if isinstance(a, AggFloat) or isinstance(b, AggFloat):
+            return math.isclose(fa, fb,
+                                rel_tol=AGG_FLOAT_TOLERANCE,
+                                abs_tol=AGG_FLOAT_TOLERANCE)
+        return math.isclose(fa, fb,
+                            rel_tol=FLOAT_TOLERANCE,
+                            abs_tol=FLOAT_TOLERANCE)
 
     return a == b
 

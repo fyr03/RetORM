@@ -60,10 +60,11 @@ class GenContext:
 
 def generate_ir(
     schema:       Schema,
-    join_prob:    float = 0.4,   # 生成 Join 的概率
+    join_prob:    float = 0.55,  # 生成 Join 的概率
     filter_prob:  float = 0.6,   # 生成 Filter(WHERE) 的概率
-    groupby_prob: float = 0.4,   # 生成 GroupBy 的概率
-    having_prob:  float = 0.5,   # GroupBy 之后生成 Having 的概率
+    groupby_prob: float = 0.45,  # 生成 GroupBy 的概率
+    having_prob:  float = 0.6,   # GroupBy 之后生成 Having 的概率
+    stress_mode:  Optional[str] = None,
     seed:         Optional[int] = None,
 ) -> Tuple[QueryNode, GenContext]:
     """
@@ -74,6 +75,11 @@ def generate_ir(
     """
     if seed is not None:
         random.seed(seed)
+    stress_mode = stress_mode or "balanced"
+
+    join_prob, filter_prob, groupby_prob, having_prob = _apply_stress_mode(
+        stress_mode, join_prob, filter_prob, groupby_prob, having_prob
+    )
 
     # ---------- Step 1: Scan ----------
     # 随机选一张主表
@@ -87,6 +93,7 @@ def generate_ir(
     # ---------- Step 2: Join（可选）----------
     # 只有 schema 里有外键关系，且随机决定加 Join 时才生成
     fk_pairs = _find_joinable_fks(schema, main_table)
+    joined = False
     if fk_pairs and random.random() < join_prob:
         fk       = random.choice(fk_pairs)
         # 找到被 join 的表
@@ -106,22 +113,26 @@ def generate_ir(
             on=on_cond,
         )
         _add_table_to_ctx(ctx, join_table, join_alias)
+        joined = True
 
     # ---------- Step 3: Filter（可选，WHERE）----------
-    if ctx.visible_cols and random.random() < filter_prob:
-        cond = _generate_condition(ctx, schema)
+    effective_filter_prob = min(1.0, filter_prob + 0.15) if joined else filter_prob
+    if ctx.visible_cols and random.random() < effective_filter_prob:
+        cond = _generate_condition(ctx, schema, stress_mode=stress_mode)
         if cond is not None:
             node = Filter(condition=cond, child=node)
 
     # ---------- Step 4: GroupBy + Aggregate（可选）----------
-    if ctx.visible_cols and random.random() < groupby_prob:
+    effective_groupby_prob = min(1.0, groupby_prob + 0.2) if joined else groupby_prob
+    if ctx.visible_cols and random.random() < effective_groupby_prob:
         # 随机选 1-2 个分组字段（只选非 VARCHAR 列，聚合数值更有意义）
         numeric_cols = _get_numeric_cols(ctx)
         all_cols     = ctx.visible_cols
 
         # 分组字段优先用全部可见列（任意类型都可以 group by）
-        num_group = random.randint(1, min(2, len(all_cols)))
-        group_fields = random.sample(all_cols, num_group)
+        group_fields = _choose_group_fields(ctx, stress_mode, all_cols)
+        if not group_fields:
+            group_fields = all_cols[:1]
 
         # 聚合字段：从数值列里选
         agg_cols = numeric_cols if numeric_cols else all_cols
@@ -153,14 +164,15 @@ def generate_ir(
         ctx.agg_aliases  = [a.alias for a in agg_list]
 
         # ---------- Step 5: Having（可选，需要 GroupBy）----------
-        if ctx.agg_aliases and random.random() < having_prob:
+        effective_having_prob = min(1.0, having_prob + 0.1) if joined else having_prob
+        if ctx.agg_aliases and random.random() < effective_having_prob:
             having_cond = _generate_having_condition(ctx)
             if having_cond is not None:
                 node = Having(condition=having_cond, child=node)
 
     # ---------- Step 6: Project ----------
     # 决定最终输出哪些列
-    project_fields = _choose_project_fields(ctx)
+    project_fields = _choose_project_fields(ctx, stress_mode=stress_mode)
     if project_fields:
         node = Project(fields=project_fields, child=node)
 
@@ -184,6 +196,26 @@ def _get_numeric_cols(ctx: GenContext) -> List[str]:
     for alias, table in ctx.tables.items():
         for col in table.columns:
             if col.col_type in (ColType.INT, ColType.FLOAT):
+                result.append(f"{alias}.{col.name}")
+    return result
+
+
+def _get_nullable_numeric_cols(ctx: GenContext) -> List[str]:
+    """返回上下文中可为 NULL 的数值列。"""
+    result = []
+    for alias, table in ctx.tables.items():
+        for col in table.columns:
+            if col.col_type in (ColType.INT, ColType.FLOAT) and col.nullable:
+                result.append(f"{alias}.{col.name}")
+    return result
+
+
+def _get_nullable_visible_cols(ctx: GenContext) -> List[str]:
+    """返回上下文中可为 NULL 的可见列。"""
+    result = []
+    for alias, table in ctx.tables.items():
+        for col in table.columns:
+            if col.nullable:
                 result.append(f"{alias}.{col.name}")
     return result
 
@@ -231,49 +263,62 @@ def _make_fk_condition(
 # 条件生成
 # ---------------------------------------------------------------------------
 
-def _generate_condition(ctx: GenContext, schema: Schema, depth: int = 0) -> Optional[Condition]:
+def _generate_condition(
+    ctx: GenContext,
+    schema: Schema,
+    depth: int = 0,
+    stress_mode: str = "balanced",
+) -> Optional[Condition]:
     """
     随机生成一个 WHERE 条件。
     depth 控制递归深度，避免生成过深的 AND/OR 树。
     """
     # 只用数值列做比较，避免字符串比较的复杂性
     numeric_cols = _get_numeric_cols(ctx)
+    nullable_numeric_cols = _get_nullable_numeric_cols(ctx)
     if not numeric_cols:
         return None
 
     # 深度 >= 2 时只生成叶节点（Compare）
     if depth >= 2:
-        return _make_compare(numeric_cols)
+        return _make_compare(numeric_cols, nullable_numeric_cols, stress_mode)
 
     r = random.random()
     if r < 0.6:
         # 60%：简单比较
-        return _make_compare(numeric_cols)
+        return _make_compare(numeric_cols, nullable_numeric_cols, stress_mode)
     elif r < 0.8:
         # 20%：AND
-        left  = _generate_condition(ctx, schema, depth + 1)
-        right = _generate_condition(ctx, schema, depth + 1)
+        left  = _generate_condition(ctx, schema, depth + 1, stress_mode)
+        right = _generate_condition(ctx, schema, depth + 1, stress_mode)
         if left and right:
             return And(left, right)
         return left or right
     elif r < 0.95:
         # 15%：OR
-        left  = _generate_condition(ctx, schema, depth + 1)
-        right = _generate_condition(ctx, schema, depth + 1)
+        left  = _generate_condition(ctx, schema, depth + 1, stress_mode)
+        right = _generate_condition(ctx, schema, depth + 1, stress_mode)
         if left and right:
             return Or(left, right)
         return left or right
     else:
         # 5%：NOT
-        child = _make_compare(numeric_cols)
+        child = _make_compare(numeric_cols, nullable_numeric_cols, stress_mode)
         return Not(child) if child else None
 
 
-def _make_compare(numeric_cols: List[str]) -> Optional[Compare]:
+def _make_compare(
+    numeric_cols: List[str],
+    nullable_numeric_cols: List[str],
+    stress_mode: str,
+) -> Optional[Compare]:
     """生成一个简单的列和字面量的比较条件。"""
     if not numeric_cols:
         return None
-    col = random.choice(numeric_cols)
+    if stress_mode == "null_heavy" and nullable_numeric_cols and random.random() < 0.8:
+        col = random.choice(nullable_numeric_cols)
+    else:
+        col = random.choice(numeric_cols)
     op  = random.choice([CmpOp.GT, CmpOp.GTE, CmpOp.LT, CmpOp.LTE, CmpOp.EQ])
     val = random.randint(1, 100)   # 字面量范围，和数据生成器保持一致
     return Compare(col, op, val)
@@ -295,7 +340,7 @@ def _generate_having_condition(ctx: GenContext) -> Optional[Condition]:
 # Project 字段选择
 # ---------------------------------------------------------------------------
 
-def _choose_project_fields(ctx: GenContext) -> List[str]:
+def _choose_project_fields(ctx: GenContext, stress_mode: str = "balanced") -> List[str]:
     """
     选择 Project 输出哪些列。
 
@@ -311,9 +356,134 @@ def _choose_project_fields(ctx: GenContext) -> List[str]:
     if not candidates:
         return []
 
+    if not ctx.has_groupby:
+        duplicate_fields = _pick_duplicate_short_name_fields(candidates)
+        duplicate_prob = 0.45
+        if stress_mode == "duplicate_column_heavy":
+            duplicate_prob = 0.9
+        elif stress_mode == "join_heavy":
+            duplicate_prob = 0.6
+
+        if duplicate_fields and random.random() < duplicate_prob:
+            chosen = list(duplicate_fields)
+            remaining = [f for f in candidates if f not in chosen]
+            extra_budget = min(2, len(remaining))
+            extra_num = random.randint(0, extra_budget) if extra_budget > 0 else 0
+            if extra_num > 0:
+                chosen.extend(random.sample(remaining, extra_num))
+            return chosen
+
+        if stress_mode == "null_heavy":
+            nullable_fields = [f for f in _get_nullable_visible_cols(ctx) if f in candidates]
+            if nullable_fields and random.random() < 0.75:
+                nullable_num = random.randint(1, len(nullable_fields))
+                chosen = random.sample(nullable_fields, nullable_num)
+                remaining = [f for f in candidates if f not in chosen]
+                if remaining and len(chosen) < len(candidates):
+                    extra_budget = min(2, len(remaining))
+                    extra_num = random.randint(0, extra_budget) if extra_budget > 0 else 0
+                    if extra_num > 0:
+                        chosen.extend(random.sample(remaining, extra_num))
+                return chosen
+
     # 随机选 1 到全部列
     num = random.randint(1, len(candidates))
     return random.sample(candidates, num)
+
+
+def _pick_duplicate_short_name_fields(fields: List[str]) -> List[str]:
+    """
+    从候选字段中找出一组“短列名相同、完整字段不同”的字段。
+
+    例如：
+      ['c.id', 'l.id', 'c.rate'] -> ['c.id', 'l.id']
+
+    用于提高重复投影字段的命中率，给 compare/oracle 更大压力。
+    """
+    groups = {}
+    for field in fields:
+        short = field.split(".", 1)[1] if "." in field else field
+        groups.setdefault(short, [])
+        if field not in groups[short]:
+            groups[short].append(field)
+
+    duplicate_groups = [group for group in groups.values() if len(group) >= 2]
+    if not duplicate_groups:
+        return []
+
+    chosen_group = random.choice(duplicate_groups)
+    if len(chosen_group) == 2:
+        return chosen_group.copy()
+
+    return random.sample(chosen_group, 2)
+
+
+def _get_preferred_group_fields(
+    ctx: GenContext,
+    stress_mode: str,
+    fallback_fields: List[str],
+) -> List[str]:
+    """根据压力模式为 GroupBy 选择更有价值的候选字段池。"""
+    if stress_mode == "null_heavy":
+        nullable_fields = [f for f in _get_nullable_visible_cols(ctx) if f in fallback_fields]
+        if nullable_fields:
+            return nullable_fields
+    return fallback_fields
+
+
+def _choose_group_fields(
+    ctx: GenContext,
+    stress_mode: str,
+    fallback_fields: List[str],
+) -> List[str]:
+    """Safely choose GroupBy fields from the current preferred pool."""
+    group_pool = _get_preferred_group_fields(ctx, stress_mode, fallback_fields)
+    if not group_pool:
+        group_pool = fallback_fields
+    if not group_pool:
+        return []
+
+    num_group = random.randint(1, min(2, len(group_pool)))
+    return random.sample(group_pool, num_group)
+
+
+def _apply_stress_mode(
+    stress_mode: str,
+    join_prob: float,
+    filter_prob: float,
+    groupby_prob: float,
+    having_prob: float,
+) -> Tuple[float, float, float, float]:
+    """根据压力模式调整基础生成概率。"""
+    if stress_mode == "join_heavy":
+        return (
+            min(1.0, join_prob + 0.25),
+            min(1.0, filter_prob + 0.1),
+            min(1.0, groupby_prob + 0.1),
+            min(1.0, having_prob + 0.1),
+        )
+    if stress_mode == "duplicate_column_heavy":
+        return (
+            min(1.0, join_prob + 0.2),
+            filter_prob,
+            min(1.0, groupby_prob + 0.05),
+            having_prob,
+        )
+    if stress_mode == "null_heavy":
+        return (
+            join_prob,
+            min(1.0, filter_prob + 0.1),
+            min(1.0, groupby_prob + 0.15),
+            min(1.0, having_prob + 0.1),
+        )
+    if stress_mode == "groupby_heavy":
+        return (
+            join_prob,
+            filter_prob,
+            min(1.0, groupby_prob + 0.3),
+            min(1.0, having_prob + 0.2),
+        )
+    return join_prob, filter_prob, groupby_prob, having_prob
 
 
 # ---------------------------------------------------------------------------

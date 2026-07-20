@@ -33,7 +33,6 @@ from ir.nodes import (
     AggFunc, CmpOp, QueryNode, Condition,
 )
 from generator.schema_gen import Schema, TableSchema, ColType, Column
-from db.connector import insert_rows, truncate_tables
 
 
 # ---------------------------------------------------------------------------
@@ -198,51 +197,58 @@ def _generate_with_z3(
     timeout_sec: int,
 ) -> Optional[TableData]:
     """
-    用 Z3 根据 IR 的 Filter / Having 条件反推满足条件的记录。
+    用 Z3 根据 IR 中“简单可约束化”的条件反推一小部分满足条件的记录。
 
     策略：
-      1. 从 IR 树中提取所有 Filter 和 Having 条件
-      2. 为每张表的每一行建立 Z3 变量
-      3. 添加约束：至少一行满足 Filter 条件
+      1. 从 IR 树中提取简单数值 Filter 条件，以及 Join on 等值条件
+      2. 为每个表别名的“第一行”建立 Z3 变量
+      3. 添加可解析的约束
       4. 求解，把解转成 Python 数据
       5. 其余行用随机值填充
+
+    注意：
+      - 当前不是完整的多行/完整 SQL 语义求解器
+      - Having 里引用聚合别名的复杂约束仍然跳过
+      - 目标是提高有效测试比例，而不是保证所有复杂查询都非空
     """
     import z3
 
-    # 提取 IR 中的 Filter 条件（只处理 INT/FLOAT 列的简单比较）
-    filter_conds = _extract_filter_conditions(ir)
-    if not filter_conds:
+    # 提取 IR 中可直接转成 Z3 的简单约束
+    alias_map = _extract_alias_map(ir)
+    constraints = _extract_z3_constraints(ir)
+    if not constraints:
         return None   # 没有可利用的条件，让调用方回退随机
 
-    # 确定涉及的表
-    involved_tables = _extract_tables(ir)
-    if not involved_tables:
+    # 确定涉及的表别名
+    if not alias_map:
         return None
 
     data: TableData = {}
     solver = z3.Solver()
     solver.set("timeout", timeout_sec * 1000)  # Z3 timeout 单位是毫秒
 
-    # 为每张涉及的表的第一行建立 Z3 变量
-    # 格式：z3_vars[table_name][col_name] = z3 变量
+    # 为每个表别名的第一行建立 Z3 变量
+    # 格式：z3_vars[alias][col_name] = z3 变量
     z3_vars: Dict[str, Dict[str, Any]] = {}
+    table_primary_alias: Dict[str, str] = {}
 
-    for tname in involved_tables:
+    for alias, tname in alias_map.items():
         table = schema.get_table(tname)
         if table is None:
             continue
-        z3_vars[tname] = {}
+        z3_vars[alias] = {}
+        table_primary_alias.setdefault(tname, alias)
         for col in table.non_pk_columns():
             if col.col_type in (ColType.INT, ColType.FLOAT):
-                var = z3.Real(f"{tname}_{col.name}_0")
-                z3_vars[tname][col.name] = var
+                var = z3.Real(f"{alias}_{col.name}_0")
+                z3_vars[alias][col.name] = var
                 # 值域约束
                 solver.add(var >= 1)
                 solver.add(var <= 100)
 
-    # 把 Filter 条件加入 solver
-    for cond in filter_conds:
-        z3_cond = _condition_to_z3(cond, z3_vars, schema)
+    # 把可解析条件加入 solver
+    for cond in constraints:
+        z3_cond = _condition_to_z3(cond, z3_vars, alias_map)
         if z3_cond is not None:
             solver.add(z3_cond)
 
@@ -274,9 +280,14 @@ def _generate_with_z3(
                         row[col.name] = random.choice(parent_ids) if parent_ids else 1
                     else:
                         row[col.name] = random.randint(1, rows_per_table)
-                elif i == 0 and tname in z3_vars and col.name in z3_vars[tname]:
+                elif (
+                    i == 0
+                    and tname in table_primary_alias
+                    and col.name in z3_vars.get(table_primary_alias[tname], {})
+                ):
                     # 第一行用 Z3 解
-                    z3_val = model.eval(z3_vars[tname][col.name])
+                    alias = table_primary_alias[tname]
+                    z3_val = model.eval(z3_vars[alias][col.name])
                     row[col.name] = _z3_val_to_python(z3_val, col.col_type)
                 else:
                     row[col.name] = _random_value(col)
@@ -287,7 +298,7 @@ def _generate_with_z3(
     return data
 
 
-def _condition_to_z3(cond: Condition, z3_vars: dict, schema: Schema):
+def _condition_to_z3(cond: Condition, z3_vars: dict, alias_map: dict):
     """把 IR 条件节点转成 Z3 表达式。只处理数值比较，其余返回 None。"""
     try:
         import z3
@@ -296,14 +307,19 @@ def _condition_to_z3(cond: Condition, z3_vars: dict, schema: Schema):
 
     if isinstance(cond, Compare):
         # 解析左侧字段
-        left_var = _resolve_z3_var(cond.field, z3_vars)
+        left_var = _resolve_z3_var(cond.field, z3_vars, alias_map)
         if left_var is None:
             return None
 
-        # 右值：只支持字面量（数值）
-        if not isinstance(cond.value, (int, float)):
+        # 右值：支持字面量数值，或另一侧列引用（常见于 Join on）
+        if isinstance(cond.value, str) and "." in cond.value:
+            right_val = _resolve_z3_var(cond.value, z3_vars, alias_map)
+            if right_val is None:
+                return None
+        elif isinstance(cond.value, (int, float)):
+            right_val = float(cond.value)
+        else:
             return None
-        right_val = float(cond.value)
 
         op = cond.op
         if op == CmpOp.EQ:
@@ -320,23 +336,23 @@ def _condition_to_z3(cond: Condition, z3_vars: dict, schema: Schema):
             return left_var <= right_val
 
     elif isinstance(cond, And):
-        l = _condition_to_z3(cond.left,  z3_vars, schema)
-        r = _condition_to_z3(cond.right, z3_vars, schema)
+        l = _condition_to_z3(cond.left,  z3_vars, alias_map)
+        r = _condition_to_z3(cond.right, z3_vars, alias_map)
         if l is not None and r is not None:
             import z3
             return z3.And(l, r)
         return l or r
 
     elif isinstance(cond, Or):
-        l = _condition_to_z3(cond.left,  z3_vars, schema)
-        r = _condition_to_z3(cond.right, z3_vars, schema)
+        l = _condition_to_z3(cond.left,  z3_vars, alias_map)
+        r = _condition_to_z3(cond.right, z3_vars, alias_map)
         if l is not None and r is not None:
             import z3
             return z3.Or(l, r)
         return l or r
 
     elif isinstance(cond, Not):
-        child = _condition_to_z3(cond.child, z3_vars, schema)
+        child = _condition_to_z3(cond.child, z3_vars, alias_map)
         if child is not None:
             import z3
             return z3.Not(child)
@@ -344,27 +360,23 @@ def _condition_to_z3(cond: Condition, z3_vars: dict, schema: Schema):
     return None
 
 
-def _resolve_z3_var(field_name: str, z3_vars: dict):
+def _resolve_z3_var(field_name: str, z3_vars: dict, alias_map: dict):
     """
     把字段名解析成 Z3 变量。
-    "o.amount" → z3_vars["orders"]["amount"]（需要反查 alias）
+    "o.amount" → z3_vars["o"]["amount"]
     "amount"   → 在所有表里搜索
     """
     if "." in field_name:
-        # 带别名前缀：需要找到 alias 对应的表名
         alias, col_name = field_name.split(".", 1)
-        # z3_vars 的 key 是表名，不是别名，需要模糊匹配
-        for tname, cols in z3_vars.items():
-            if tname.startswith(alias) or alias.startswith(tname[0]):
-                if col_name in cols:
-                    return cols[col_name]
-        # 直接用 alias 当表名试试
-        if alias in z3_vars and col_name in z3_vars[alias]:
+        if alias in alias_map and alias in z3_vars and col_name in z3_vars[alias]:
             return z3_vars[alias][col_name]
     else:
-        for tname, cols in z3_vars.items():
+        matches = []
+        for cols in z3_vars.values():
             if field_name in cols:
-                return cols[field_name]
+                matches.append(cols[field_name])
+        if len(matches) == 1:
+            return matches[0]
     return None
 
 
@@ -393,22 +405,45 @@ def _z3_val_to_python(z3_val, col_type: ColType) -> Any:
 # IR 遍历工具
 # ---------------------------------------------------------------------------
 
-def _extract_filter_conditions(ir: QueryNode) -> List[Condition]:
-    """从 IR 树中递归提取所有 Filter 和 Having 的条件。"""
+def _extract_z3_constraints(ir: QueryNode) -> List[Condition]:
+    """
+    从 IR 树中提取适合交给 Z3 的简单约束。
+
+    当前包含：
+      - Filter 条件
+      - Join on 的等值条件
+
+    当前仍跳过：
+      - Having 中引用聚合别名的复杂条件
+    """
     result = []
     if isinstance(ir, Filter):
         result.append(ir.condition)
-        result.extend(_extract_filter_conditions(ir.child))
+        result.extend(_extract_z3_constraints(ir.child))
     elif isinstance(ir, Having):
         # Having 条件引用聚合别名，Z3 处理较复杂，暂时跳过
-        result.extend(_extract_filter_conditions(ir.child))
+        result.extend(_extract_z3_constraints(ir.child))
     elif isinstance(ir, (Project, GroupBy)):
-        result.extend(_extract_filter_conditions(ir.child))
+        result.extend(_extract_z3_constraints(ir.child))
     elif isinstance(ir, Join):
-        result.extend(_extract_filter_conditions(ir.left))
-        result.extend(_extract_filter_conditions(ir.right))
+        result.append(ir.on)
+        result.extend(_extract_z3_constraints(ir.left))
+        result.extend(_extract_z3_constraints(ir.right))
     elif isinstance(ir, Scan):
         pass
+    return result
+
+
+def _extract_alias_map(ir: QueryNode) -> Dict[str, str]:
+    """从 IR 树中提取 alias -> table_name 的显式映射。"""
+    result: Dict[str, str] = {}
+    if isinstance(ir, Scan):
+        result[ir.alias] = ir.table
+    elif isinstance(ir, Join):
+        result.update(_extract_alias_map(ir.left))
+        result.update(_extract_alias_map(ir.right))
+    elif hasattr(ir, "child"):
+        result.update(_extract_alias_map(ir.child))
     return result
 
 
@@ -431,6 +466,8 @@ def _extract_tables(ir: QueryNode) -> List[str]:
 
 def _insert_all(schema: Schema, data: TableData) -> None:
     """把 TableData 里的所有数据插入数据库。"""
+    from db.connector import insert_rows
+
     from generator.schema_gen import generate_drop_sqls
     ordered_names = list(reversed(generate_drop_sqls(schema)))
 
