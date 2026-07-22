@@ -29,7 +29,7 @@ sys.path.insert(0, __file__.rsplit("/translators", 1)[0])
 from ir.nodes import (
     Scan, Filter, Join, GroupBy, Having, Project,
     Compare, And, Or, Not, Aggregate,
-    AggFunc, CmpOp, QueryNode, Condition,
+    AggFunc, CmpOp, JoinType, QueryNode, Condition,
 )
 from db.connector import execute_sql
 
@@ -157,9 +157,10 @@ def _translate_join(node: Join):
     on    = _translate_condition(node.on)
 
     select = "SELECT *"
+    join_keyword = "LEFT JOIN" if node.join_type == JoinType.LEFT else "INNER JOIN"
     from_  = (
         f"FROM `{left.table}` AS `{left.alias}`\n"
-        f"INNER JOIN `{right.table}` AS `{right.alias}` ON {on}"
+        f"{join_keyword} `{right.table}` AS `{right.alias}` ON {on}"
     )
     return select, from_, None, None, None
 
@@ -313,7 +314,12 @@ def _translate_condition(cond: Condition, agg_expr_map: dict = None) -> str:
             left = agg_expr_map[field_name]
         else:
             left = _quote_field(field_name)
-        op    = cond.op.value
+        op = cond.op.value
+        if cond.value is None:
+            if cond.op == CmpOp.EQ:
+                return f"{left} IS NULL"
+            if cond.op == CmpOp.NEQ:
+                return f"{left} IS NOT NULL"
         right = _quote_value(cond.value)
         return f"{left} {op} {right}"
 

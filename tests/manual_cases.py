@@ -2,13 +2,24 @@
 
 import os
 import sys
+import types
 from decimal import Decimal
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+if "db.connector" not in sys.modules:
+    connector_stub = types.ModuleType("db.connector")
+    connector_stub.execute_sql = lambda *args, **kwargs: []
+    sys.modules["db.connector"] = connector_stub
+
 from comparator.compare import compare_two_paths, normalize
-from generator.data_gen import _extract_alias_map, _extract_z3_constraints, _resolve_z3_var
+from generator.data_gen import (
+    _extract_alias_map,
+    _extract_z3_constraints,
+    _random_value,
+    _resolve_z3_var,
+)
 from generator.ir_gen import (
     GenContext,
     _choose_group_fields,
@@ -16,7 +27,9 @@ from generator.ir_gen import (
     _generate_condition,
 )
 from generator.schema_gen import ColType, Column, TableSchema
-from ir.nodes import Compare, CmpOp, Filter, Join, Scan
+from ir.nodes import Compare, CmpOp, Filter, Join, JoinType, Project, Scan
+from translators.python_ref import _eval_condition_3vl, _eval_join
+from translators.sql import translate
 
 
 def test_compare_duplicate_projected_columns():
@@ -107,7 +120,7 @@ def test_data_gen_resolves_aliases_without_fuzzy_matching():
     assert _resolve_z3_var("amount", z3_vars, alias_map) is None
 
 
-def test_ir_generator_null_heavy_prefers_nullable_numeric_columns():
+def test_ir_generator_null_heavy_can_emit_null_predicates():
     table = TableSchema(
         name="items",
         columns=[
@@ -121,15 +134,100 @@ def test_ir_generator_null_heavy_prefers_nullable_numeric_columns():
         tables={"i": table},
     )
 
-    with patch("generator.ir_gen.random.random", return_value=0.0), patch(
+    with patch("generator.ir_gen.random.random", side_effect=[0.0, 0.0]), patch(
         "generator.ir_gen.random.choice",
         side_effect=["i.nullable_score", CmpOp.EQ],
-    ), patch("generator.ir_gen.random.randint", return_value=42):
+    ):
         cond = _generate_condition(ctx, schema=None, stress_mode="null_heavy")
 
     assert isinstance(cond, Compare)
     assert cond.field == "i.nullable_score"
-    assert cond.value == 42
+    assert cond.value is None
+
+
+def test_sql_translate_uses_is_null_and_is_not_null():
+    ir_is_null = Project(
+        fields=["u.id"],
+        child=Filter(
+            condition=Compare("u.score", CmpOp.EQ, None),
+            child=Scan("users", "u"),
+        ),
+    )
+    ir_is_not_null = Project(
+        fields=["u.id"],
+        child=Filter(
+            condition=Compare("u.score", CmpOp.NEQ, None),
+            child=Scan("users", "u"),
+        ),
+    )
+
+    assert "IS NULL" in translate(ir_is_null)
+    assert "IS NOT NULL" in translate(ir_is_not_null)
+
+
+def test_sql_translate_supports_left_join():
+    ir = Project(
+        fields=["o.id", "u.score"],
+        child=Join(
+            left=Scan("orders", "o"),
+            right=Scan("users", "u"),
+            on=Compare("o.user_id", CmpOp.EQ, "u.id"),
+            join_type=JoinType.LEFT,
+        ),
+    )
+
+    assert "LEFT JOIN" in translate(ir)
+
+
+def test_python_ref_null_compare_matches_is_null_semantics():
+    row = {"u.score": None, "u.id": 1}
+    not_null_row = {"u.score": 7, "u.id": 2}
+
+    assert _eval_condition_3vl(Compare("u.score", CmpOp.EQ, None), row) is True
+    assert _eval_condition_3vl(Compare("u.score", CmpOp.EQ, None), not_null_row) is False
+    assert _eval_condition_3vl(Compare("u.score", CmpOp.NEQ, None), row) is False
+    assert _eval_condition_3vl(Compare("u.score", CmpOp.NEQ, None), not_null_row) is True
+
+
+def test_python_ref_left_join_null_extends_unmatched_rows():
+    join = Join(
+        left=Scan("orders", "o"),
+        right=Scan("users", "u"),
+        on=Compare("o.user_id", CmpOp.EQ, "u.id"),
+        join_type=JoinType.LEFT,
+    )
+
+    def _fake_eval(node):
+        if isinstance(node, Scan) and node.alias == "o":
+            return [
+                {"o.id": 1, "o.user_id": 1},
+                {"o.id": 2, "o.user_id": 99},
+            ]
+        if isinstance(node, Scan) and node.alias == "u":
+            return [
+                {"u.id": 1, "u.score": 7},
+            ]
+        raise AssertionError(f"unexpected node: {node}")
+
+    with patch("translators.python_ref._eval", side_effect=_fake_eval):
+        rows = _eval_join(join)
+
+    assert rows == [
+        {"o.id": 1, "o.user_id": 1, "u.id": 1, "u.score": 7},
+        {"o.id": 2, "o.user_id": 99, "u.id": None, "u.score": None},
+    ]
+
+
+def test_data_gen_null_heavy_raises_null_probability():
+    nullable_int = Column(name="score", col_type=ColType.INT, nullable=True)
+
+    with patch("generator.data_gen.random.random", return_value=0.3):
+        assert _random_value(nullable_int, stress_mode="null_heavy") is None
+
+    with patch("generator.data_gen.random.random", return_value=0.3), patch(
+        "generator.data_gen.random.randint", return_value=17
+    ):
+        assert _random_value(nullable_int, stress_mode="balanced") == 17
 
 
 def test_ir_generator_groupby_sampling_respects_preferred_pool_size():
@@ -169,6 +267,11 @@ if __name__ == "__main__":
     test_ir_generator_prefers_duplicate_pair_when_available()
     test_data_gen_extracts_alias_map_and_join_constraints()
     test_data_gen_resolves_aliases_without_fuzzy_matching()
-    test_ir_generator_null_heavy_prefers_nullable_numeric_columns()
+    test_ir_generator_null_heavy_can_emit_null_predicates()
+    test_sql_translate_uses_is_null_and_is_not_null()
+    test_sql_translate_supports_left_join()
+    test_python_ref_null_compare_matches_is_null_semantics()
+    test_python_ref_left_join_null_extends_unmatched_rows()
+    test_data_gen_null_heavy_raises_null_probability()
     test_ir_generator_groupby_sampling_respects_preferred_pool_size()
     print("manual_cases: all checks passed")

@@ -32,7 +32,7 @@ from sqlalchemy.engine import Engine
 from ir.nodes import (
     Scan, Filter, Join, GroupBy, Having, Project,
     Compare, And, Or, Not, Aggregate,
-    AggFunc, CmpOp, QueryNode, Condition,
+    AggFunc, CmpOp, JoinType, QueryNode, Condition,
 )
 from db.connector import get_engine
 
@@ -194,7 +194,10 @@ def _build_join(node: Join, engine: Engine):
     on_cond = _build_condition(node.on, ctx)
 
     # 把 JOIN 合并进 froms：用 SQLAlchemy 的 join()
-    joined = left_tbl.join(right_tbl, on_cond)
+    if node.join_type == JoinType.LEFT:
+        joined = left_tbl.outerjoin(right_tbl, on_cond)
+    else:
+        joined = left_tbl.join(right_tbl, on_cond)
     ctx["froms"] = [joined]
 
     return ctx
@@ -299,7 +302,10 @@ def _build_join_ctx(node: Join, engine: Engine):
     }
 
     on_cond = _build_condition(node.on, ctx)
-    joined  = left_tbl.join(right_tbl, on_cond)
+    if node.join_type == JoinType.LEFT:
+        joined = left_tbl.outerjoin(right_tbl, on_cond)
+    else:
+        joined = left_tbl.join(right_tbl, on_cond)
     ctx["froms"] = [joined]
     return ctx
 
@@ -396,6 +402,12 @@ def _build_condition(cond: Condition, ctx: dict):
             right = _resolve_col(cond.value, ctx)
         else:
             right = cond.value
+
+        if right is None:
+            if op == CmpOp.EQ:
+                return left_col.is_(None)
+            if op == CmpOp.NEQ:
+                return left_col.is_not(None)
 
         if op == CmpOp.EQ:
             return left_col == right

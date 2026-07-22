@@ -53,6 +53,7 @@ def generate_and_insert(
     rows_per_table: int = 8,
     use_z3:     bool = True,
     z3_timeout: int  = 5,
+    stress_mode: str = "balanced",
     seed:       Optional[int] = None,
 ) -> TableData:
     """
@@ -75,7 +76,13 @@ def generate_and_insert(
     # 先尝试 Z3（只有安装了 z3-solver 且 use_z3=True 时才用）
     if use_z3:
         try:
-            data = _generate_with_z3(schema, ir, rows_per_table, z3_timeout)
+            data = _generate_with_z3(
+                schema,
+                ir,
+                rows_per_table,
+                z3_timeout,
+                stress_mode=stress_mode,
+            )
             if data:
                 _insert_all(schema, data)
                 return data
@@ -83,7 +90,7 @@ def generate_and_insert(
             print(f"[data_gen] Z3 生成失败（{e}），回退到随机生成")
 
     # 随机生成
-    data = _generate_random(schema, rows_per_table)
+    data = _generate_random(schema, rows_per_table, stress_mode=stress_mode)
     _insert_all(schema, data)
     return data
 
@@ -91,6 +98,7 @@ def generate_and_insert(
 def generate_random_only(
     schema:         Schema,
     rows_per_table: int = 8,
+    stress_mode:    str = "balanced",
     seed:           Optional[int] = None,
 ) -> TableData:
     """
@@ -99,7 +107,7 @@ def generate_random_only(
     """
     if seed is not None:
         random.seed(seed)
-    data = _generate_random(schema, rows_per_table)
+    data = _generate_random(schema, rows_per_table, stress_mode=stress_mode)
     _insert_all(schema, data)
     return data
 
@@ -108,7 +116,11 @@ def generate_random_only(
 # 随机数据生成
 # ---------------------------------------------------------------------------
 
-def _generate_random(schema: Schema, rows_per_table: int) -> TableData:
+def _generate_random(
+    schema: Schema,
+    rows_per_table: int,
+    stress_mode: str = "balanced",
+) -> TableData:
     """
     为 schema 里每张表随机生成数据。
 
@@ -124,7 +136,7 @@ def _generate_random(schema: Schema, rows_per_table: int) -> TableData:
 
     for tname in ordered_names:
         table  = schema.get_table(tname)
-        rows   = _generate_table_rows(table, rows_per_table, data)
+        rows = _generate_table_rows(table, rows_per_table, data, stress_mode=stress_mode)
         data[tname] = rows
 
     return data
@@ -134,9 +146,15 @@ def _generate_table_rows(
     table:  TableSchema,
     n:      int,
     existing_data: TableData,
+    stress_mode: str = "balanced",
 ) -> List[Row]:
     """为单张表生成 n 行数据。"""
     rows = []
+    value_pools = {
+        col.name: _build_value_pool(col, stress_mode)
+        for col in table.columns
+        if not col.is_pk and not _is_fk_col(col.name, table)
+    }
     for i in range(n):
         row: Row = {}
         for col in table.columns:
@@ -147,30 +165,79 @@ def _generate_table_rows(
                 ref_table_name = _get_fk_ref_table(col.name, table)
                 if ref_table_name and ref_table_name in existing_data:
                     parent_ids = [r["id"] for r in existing_data[ref_table_name]]
-                    row[col.name] = random.choice(parent_ids) if parent_ids else 1
+                    row[col.name] = (
+                        _choose_parent_id(parent_ids, stress_mode) if parent_ids else 1
+                    )
                 else:
                     row[col.name] = random.randint(1, n)
             else:
-                row[col.name] = _random_value(col)
+                row[col.name] = _random_value(
+                    col,
+                    stress_mode=stress_mode,
+                    pool=value_pools.get(col.name),
+                )
         rows.append(row)
     return rows
 
 
-def _random_value(col: Column) -> Any:
+def _random_value(
+    col: Column,
+    stress_mode: str = "balanced",
+    pool: Optional[List[Any]] = None,
+) -> Any:
     """根据列类型生成随机值。"""
     # 以 nullable_prob 决定是否生成 NULL
-    if col.nullable and random.random() < 0.15:
+    null_prob = 0.15
+    if stress_mode == "null_heavy":
+        null_prob = 0.45
+    elif stress_mode == "groupby_heavy":
+        null_prob = 0.22
+    if col.nullable and random.random() < null_prob:
         return None
 
+    if pool:
+        reuse_prob = 0.55
+        if stress_mode in ("groupby_heavy", "join_heavy", "duplicate_column_heavy"):
+            reuse_prob = 0.8
+        elif stress_mode == "null_heavy":
+            reuse_prob = 0.7
+        if random.random() < reuse_prob:
+            return random.choice(pool)
+
+    return _random_scalar_value(col)
+
+
+def _random_scalar_value(col: Column) -> Any:
+    """Generate a non-NULL scalar value for a single column."""
     if col.col_type == ColType.INT:
         return random.randint(1, 100)
-    elif col.col_type == ColType.FLOAT:
+    if col.col_type == ColType.FLOAT:
         return round(random.uniform(1.0, 100.0), 1)
-    elif col.col_type == ColType.VARCHAR:
+    if col.col_type == ColType.VARCHAR:
         length = random.randint(3, 8)
         return "".join(random.choices(string.ascii_lowercase, k=length))
-    else:
-        return random.randint(1, 100)
+    return random.randint(1, 100)
+
+
+def _build_value_pool(col: Column, stress_mode: str) -> List[Any]:
+    """Build a small reuse pool to increase duplicate and boundary-value coverage."""
+    pool_size = 2
+    if stress_mode in ("groupby_heavy", "join_heavy", "duplicate_column_heavy"):
+        pool_size = 3
+    return [_random_scalar_value(col) for _ in range(pool_size)]
+
+
+def _choose_parent_id(parent_ids: List[int], stress_mode: str) -> int:
+    """Bias FK selection toward collisions in stress modes that benefit from denser joins."""
+    if not parent_ids:
+        return 1
+
+    if stress_mode in ("join_heavy", "groupby_heavy", "duplicate_column_heavy"):
+        hot_ids = parent_ids[: min(2, len(parent_ids))]
+        if hot_ids and random.random() < 0.8:
+            return random.choice(hot_ids)
+
+    return random.choice(parent_ids)
 
 
 def _is_fk_col(col_name: str, table: TableSchema) -> bool:
@@ -195,6 +262,7 @@ def _generate_with_z3(
     ir:         QueryNode,
     rows_per_table: int,
     timeout_sec: int,
+    stress_mode: str = "balanced",
 ) -> Optional[TableData]:
     """
     用 Z3 根据 IR 中“简单可约束化”的条件反推一小部分满足条件的记录。
@@ -266,7 +334,12 @@ def _generate_with_z3(
 
     for tname in ordered_names:
         table = schema.get_table(tname)
-        rows  = []
+        rows = []
+        value_pools = {
+            col.name: _build_value_pool(col, stress_mode)
+            for col in table.columns
+            if not col.is_pk and not _is_fk_col(col.name, table)
+        }
 
         for i in range(rows_per_table):
             row: Row = {}
@@ -277,7 +350,9 @@ def _generate_with_z3(
                     ref_tname = _get_fk_ref_table(col.name, table)
                     if ref_tname and ref_tname in data:
                         parent_ids = [r["id"] for r in data[ref_tname]]
-                        row[col.name] = random.choice(parent_ids) if parent_ids else 1
+                        row[col.name] = (
+                            _choose_parent_id(parent_ids, stress_mode) if parent_ids else 1
+                        )
                     else:
                         row[col.name] = random.randint(1, rows_per_table)
                 elif (
@@ -290,7 +365,11 @@ def _generate_with_z3(
                     z3_val = model.eval(z3_vars[alias][col.name])
                     row[col.name] = _z3_val_to_python(z3_val, col.col_type)
                 else:
-                    row[col.name] = _random_value(col)
+                    row[col.name] = _random_value(
+                        col,
+                        stress_mode=stress_mode,
+                        pool=value_pools.get(col.name),
+                    )
             rows.append(row)
 
         data[tname] = rows

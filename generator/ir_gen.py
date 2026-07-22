@@ -26,7 +26,7 @@ from typing import List, Optional, Tuple
 from ir.nodes import (
     Scan, Filter, Join, GroupBy, Having, Project,
     Compare, And, Or, Not, Aggregate,
-    AggFunc, CmpOp, QueryNode, Condition,
+    AggFunc, CmpOp, JoinType, QueryNode, Condition,
 )
 from generator.schema_gen import Schema, TableSchema, ColType, Column, ForeignKey
 
@@ -106,11 +106,13 @@ def generate_ir(
             join_alias = join_alias + "2"
 
         on_cond = _make_fk_condition(fk, alias, join_alias, main_table, join_table)
+        join_type = _choose_join_type(stress_mode)
 
         node = Join(
             left=Scan(main_table.name, alias),
             right=Scan(join_table.name, join_alias),
             on=on_cond,
+            join_type=join_type,
         )
         _add_table_to_ctx(ctx, join_table, join_alias)
         joined = True
@@ -276,17 +278,28 @@ def _generate_condition(
     # 只用数值列做比较，避免字符串比较的复杂性
     numeric_cols = _get_numeric_cols(ctx)
     nullable_numeric_cols = _get_nullable_numeric_cols(ctx)
+    nullable_visible_cols = _get_nullable_visible_cols(ctx)
     if not numeric_cols:
         return None
 
     # 深度 >= 2 时只生成叶节点（Compare）
     if depth >= 2:
-        return _make_compare(numeric_cols, nullable_numeric_cols, stress_mode)
+        return _make_compare(
+            numeric_cols,
+            nullable_numeric_cols,
+            nullable_visible_cols,
+            stress_mode,
+        )
 
     r = random.random()
     if r < 0.6:
         # 60%：简单比较
-        return _make_compare(numeric_cols, nullable_numeric_cols, stress_mode)
+        return _make_compare(
+            numeric_cols,
+            nullable_numeric_cols,
+            nullable_visible_cols,
+            stress_mode,
+        )
     elif r < 0.8:
         # 20%：AND
         left  = _generate_condition(ctx, schema, depth + 1, stress_mode)
@@ -303,18 +316,32 @@ def _generate_condition(
         return left or right
     else:
         # 5%：NOT
-        child = _make_compare(numeric_cols, nullable_numeric_cols, stress_mode)
+        child = _make_compare(
+            numeric_cols,
+            nullable_numeric_cols,
+            nullable_visible_cols,
+            stress_mode,
+        )
         return Not(child) if child else None
 
 
 def _make_compare(
     numeric_cols: List[str],
     nullable_numeric_cols: List[str],
+    nullable_visible_cols: List[str],
     stress_mode: str,
 ) -> Optional[Compare]:
     """生成一个简单的列和字面量的比较条件。"""
     if not numeric_cols:
         return None
+    if (
+        stress_mode == "null_heavy"
+        and nullable_visible_cols
+        and random.random() < 0.45
+    ):
+        col = random.choice(nullable_visible_cols)
+        op = random.choice([CmpOp.EQ, CmpOp.NEQ])
+        return Compare(col, op, None)
     if stress_mode == "null_heavy" and nullable_numeric_cols and random.random() < 0.8:
         col = random.choice(nullable_numeric_cols)
     else:
@@ -445,6 +472,18 @@ def _choose_group_fields(
 
     num_group = random.randint(1, min(2, len(group_pool)))
     return random.sample(group_pool, num_group)
+
+
+def _choose_join_type(stress_mode: str) -> JoinType:
+    """Choose between INNER and LEFT join, with more LEFT joins in high-risk modes."""
+    left_prob = 0.1
+    if stress_mode == "join_heavy":
+        left_prob = 0.35
+    elif stress_mode == "null_heavy":
+        left_prob = 0.55
+    elif stress_mode == "groupby_heavy":
+        left_prob = 0.2
+    return JoinType.LEFT if random.random() < left_prob else JoinType.INNER
 
 
 def _apply_stress_mode(

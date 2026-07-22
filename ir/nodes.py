@@ -37,6 +37,7 @@ class CmpOp(Enum):
 class JoinType(Enum):
     """JOIN 类型，目前只用 INNER，后续可扩展 LEFT"""
     INNER = "INNER"
+    LEFT  = "LEFT"
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +270,7 @@ def pretty_print(node, indent: int = 0) -> str:
         left_str  = pretty_print(node.left,  indent + 1)
         right_str = pretty_print(node.right, indent + 1)
         on_str    = _fmt_condition(node.on)
-        return (f"{pad}Join(\n{pad}  on={on_str},\n"
+        return (f"{pad}Join(\n{pad}  type={node.join_type.value},\n{pad}  on={on_str},\n"
                 f"{pad}  left=\n{left_str},\n"
                 f"{pad}  right=\n{right_str}\n{pad})")
 

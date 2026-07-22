@@ -24,7 +24,7 @@ sys.path.insert(0, __file__.rsplit("/translators", 1)[0])
 from ir.nodes import (
     Scan, Filter, Join, GroupBy, Having, Project,
     Compare, And, Or, Not, Aggregate,
-    AggFunc, CmpOp, QueryNode, Condition,
+    AggFunc, CmpOp, JoinType, QueryNode, Condition,
 )
 from db.connector import execute_sql
 
@@ -124,15 +124,20 @@ def _eval_join(node: Join) -> Rows:
     """
     left_rows  = _eval(node.left)
     right_rows = _eval(node.right)
+    right_null_row = {key: None for key in right_rows[0].keys()} if right_rows else {}
 
     result = []
     for l_row in left_rows:
+        matched = False
         for r_row in right_rows:
             # 合并两行
             merged = {**l_row, **r_row}
             # 检查 on 条件
             if _eval_condition(node.on, merged):
+                matched = True
                 result.append(merged)
+        if node.join_type == JoinType.LEFT and not matched:
+            result.append({**l_row, **right_null_row})
     return result
 
 
@@ -277,6 +282,11 @@ def _eval_condition_3vl(cond: Condition, row: Row):
             right_val = _resolve_field(cond.value, row)
         else:
             right_val = cond.value
+        if right_val is None and not (isinstance(cond.value, str) and "." in str(cond.value)):
+            if cond.op == CmpOp.EQ:
+                return left_val is None
+            if cond.op == CmpOp.NEQ:
+                return left_val is not None
 
         # 任一操作数为 NULL → 结果为 NULL
         if left_val is None or right_val is None:

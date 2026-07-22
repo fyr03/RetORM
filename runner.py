@@ -46,7 +46,20 @@ from db.connector import (
     init_database, create_tables, drop_tables,
     execute_sql, dispose_engine,
 )
-from ir.nodes import pretty_print, Scan, Filter, Join, GroupBy, Having, Project
+from ir.nodes import (
+    pretty_print,
+    Scan,
+    Filter,
+    Join,
+    GroupBy,
+    Having,
+    Project,
+    Compare,
+    And,
+    Or,
+    Not,
+    JoinType,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +142,7 @@ class _StatsPrinter(threading.Thread):
             f"[运行统计]  耗时={elapsed}s  速度={qpm} q/min , 查询总数  : {total}",
             f"  通过      : {s.passed}  ({pass_rate}),  空结果    : {s.empty_results}  ({empty_rate}),  执行错误  : {s.errors}  ({error_rate})",
             f"  SQL bug   : {s.sql_bugs},  ORM bug   : {s.orm_bugs},  bug 合计  : {bug_total}  ({bug_rate})",
-            f"  结构覆盖  : 单表={s.single_table_queries}, Join={s.join_queries}, Filter={s.filter_queries}, GroupBy={s.groupby_queries}, Having={s.having_queries}, 重复投影={s.duplicate_proj_queries}",
+            f"  结构覆盖  : 单表={s.single_table_queries}, Join={s.join_queries}, LEFT JOIN={s.left_join_queries}, Filter={s.filter_queries}, GroupBy={s.groupby_queries}, Having={s.having_queries}, 重复投影={s.duplicate_proj_queries}, NULL谓词={s.null_predicate_queries}",
         ]
         for line in lines:
             self.run_logger.info(line)
@@ -175,6 +188,8 @@ class RunStats:
     groupby_queries:        int = 0
     having_queries:         int = 0
     duplicate_proj_queries: int = 0
+    null_predicate_queries: int = 0
+    left_join_queries:      int = 0
     bug_reports:   List[BugReport] = field(default_factory=list)
 
 
@@ -635,6 +650,7 @@ def run(
                         rows_per_table=config.RANDOM_ROWS,
                         use_z3=use_z3,
                         z3_timeout=config.Z3_TIMEOUT_SEC,
+                        stress_mode=stress_mode,
                         seed=query_seed,
                     )
                 except Exception as e:
@@ -803,9 +819,10 @@ def run(
     run_logger.info(f"  bug 合计  : {s.sql_bugs + s.orm_bugs}")
     run_logger.info(
         "  结构覆盖  : "
-        f"单表={s.single_table_queries}  Join={s.join_queries}  "
+        f"单表={s.single_table_queries}  Join={s.join_queries}  LEFT JOIN={s.left_join_queries}  "
         f"Filter={s.filter_queries}  GroupBy={s.groupby_queries}  "
-        f"Having={s.having_queries}  重复投影={s.duplicate_proj_queries}"
+        f"Having={s.having_queries}  重复投影={s.duplicate_proj_queries}  "
+        f"NULL谓词={s.null_predicate_queries}"
     )
     if s.bug_reports:
         run_logger.info(f"  复现脚本  : {bug_dir}/")
@@ -847,6 +864,8 @@ def _record_query_shape(stats: RunStats, ir) -> None:
         stats.join_queries += 1
     else:
         stats.single_table_queries += 1
+    if features["has_left_join"]:
+        stats.left_join_queries += 1
 
     if features["has_filter"]:
         stats.filter_queries += 1
@@ -856,6 +875,8 @@ def _record_query_shape(stats: RunStats, ir) -> None:
         stats.having_queries += 1
     if features["has_duplicate_projection"]:
         stats.duplicate_proj_queries += 1
+    if features["has_null_predicate"]:
+        stats.null_predicate_queries += 1
 
 
 def _collect_query_features(node) -> dict:
@@ -865,16 +886,34 @@ def _collect_query_features(node) -> dict:
         "has_groupby": False,
         "has_having": False,
         "has_duplicate_projection": False,
+        "has_null_predicate": False,
+        "has_left_join": False,
     }
+
+    def visit_condition(cond):
+        if isinstance(cond, Compare):
+            if cond.value is None:
+                features["has_null_predicate"] = True
+            return
+        if isinstance(cond, And) or isinstance(cond, Or):
+            visit_condition(cond.left)
+            visit_condition(cond.right)
+            return
+        if isinstance(cond, Not):
+            visit_condition(cond.child)
 
     def visit(cur):
         if isinstance(cur, Join):
+            visit_condition(cur.on)
             features["has_join"] = True
+            if cur.join_type == JoinType.LEFT:
+                features["has_left_join"] = True
             visit(cur.left)
             visit(cur.right)
             return
         if isinstance(cur, Filter):
             features["has_filter"] = True
+            visit_condition(cur.condition)
             visit(cur.child)
             return
         if isinstance(cur, GroupBy):
@@ -883,6 +922,7 @@ def _collect_query_features(node) -> dict:
             return
         if isinstance(cur, Having):
             features["has_having"] = True
+            visit_condition(cur.condition)
             visit(cur.child)
             return
         if isinstance(cur, Project):
@@ -913,10 +953,12 @@ def _print_final_report(stats: RunStats, bug_dir: str = "bugs") -> None:
     print("  结构覆盖    :")
     print(f"    单表      : {stats.single_table_queries}")
     print(f"    Join      : {stats.join_queries}")
+    print(f"    LEFT JOIN : {stats.left_join_queries}")
     print(f"    Filter    : {stats.filter_queries}")
     print(f"    GroupBy   : {stats.groupby_queries}")
     print(f"    Having    : {stats.having_queries}")
     print(f"    重复投影  : {stats.duplicate_proj_queries}")
+    print(f"    NULL谓词   : {stats.null_predicate_queries}")
     print("=" * 60)
 
     if not stats.bug_reports:
