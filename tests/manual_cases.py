@@ -11,9 +11,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if "db.connector" not in sys.modules:
     connector_stub = types.ModuleType("db.connector")
     connector_stub.execute_sql = lambda *args, **kwargs: []
+    connector_stub.get_engine = lambda *args, **kwargs: None
+    connector_stub.init_database = lambda *args, **kwargs: None
+    connector_stub.create_tables = lambda *args, **kwargs: None
+    connector_stub.drop_tables = lambda *args, **kwargs: None
+    connector_stub.dispose_engine = lambda *args, **kwargs: None
     sys.modules["db.connector"] = connector_stub
 
-from comparator.compare import compare_two_paths, normalize
+from comparator.compare import CompareResult, compare_two_paths, normalize
 from generator.data_gen import (
     _extract_alias_map,
     _extract_z3_constraints,
@@ -25,11 +30,13 @@ from generator.ir_gen import (
     _choose_group_fields,
     _choose_project_fields,
     _generate_condition,
+    _get_nullable_visible_cols,
 )
 from generator.schema_gen import ColType, Column, TableSchema
 from ir.nodes import Compare, CmpOp, Filter, Join, JoinType, Project, Scan
 from translators.python_ref import _eval_condition_3vl, _eval_join
 from translators.sql import translate
+from runner import BugReport, _report_has_actionable_bug
 
 
 def test_compare_duplicate_projected_columns():
@@ -179,6 +186,28 @@ def test_sql_translate_supports_left_join():
     assert "LEFT JOIN" in translate(ir)
 
 
+def test_sql_translate_supports_nested_join_chain():
+    ir = Project(
+        fields=["o.id", "u.score", "p.amount"],
+        child=Join(
+            left=Join(
+                left=Scan("orders", "o"),
+                right=Scan("users", "u"),
+                on=Compare("o.user_id", CmpOp.EQ, "u.id"),
+                join_type=JoinType.LEFT,
+            ),
+            right=Scan("payments", "p"),
+            on=Compare("p.order_id", CmpOp.EQ, "o.id"),
+            join_type=JoinType.INNER,
+        ),
+    )
+
+    sql = translate(ir)
+    assert sql.count("JOIN") == 2
+    assert "LEFT JOIN" in sql
+    assert "INNER JOIN" in sql
+
+
 def test_python_ref_null_compare_matches_is_null_semantics():
     row = {"u.score": None, "u.id": 1}
     not_null_row = {"u.score": 7, "u.id": 2}
@@ -257,6 +286,86 @@ def test_ir_generator_groupby_sampling_respects_preferred_pool_size():
     sample_mock.assert_called_once_with(["i.nullable_score"], 1)
 
 
+def test_ir_generator_treats_left_join_right_columns_as_query_nullable():
+    table = TableSchema(
+        name="users",
+        columns=[
+            Column(name="id", col_type=ColType.INT, nullable=False, is_pk=True),
+            Column(name="score", col_type=ColType.INT, nullable=False),
+        ],
+    )
+    ctx = GenContext(tables={"u": table}, visible_cols=["u.id", "u.score"])
+    ctx.query_nullable_cols.add("u.score")
+
+    assert _get_nullable_visible_cols(ctx) == ["u.score"]
+
+
+def test_runner_skips_all_matched_bug_reports():
+    report = BugReport(
+        schema_id=0,
+        query_id=0,
+        schema=None,
+        ir=None,
+        ir_str="",
+        schema_seed=1,
+        query_seed=2,
+        table_data={},
+        rows_per_table=0,
+        use_z3=False,
+        z3_timeout=0,
+        ref_vs_sql=CompareResult(match=True),
+        ref_vs_orm=CompareResult(match=True),
+        ref_rows=[],
+        sql_rows=[],
+        orm_rows=[],
+    )
+
+    assert _report_has_actionable_bug(report) is False
+
+
+def test_runner_keeps_real_mismatches_and_errors():
+    mismatch_report = BugReport(
+        schema_id=0,
+        query_id=0,
+        schema=None,
+        ir=None,
+        ir_str="",
+        schema_seed=1,
+        query_seed=2,
+        table_data={},
+        rows_per_table=0,
+        use_z3=False,
+        z3_timeout=0,
+        ref_vs_sql=CompareResult(match=False, reason="mismatch"),
+        ref_vs_orm=CompareResult(match=True),
+        ref_rows=[],
+        sql_rows=[],
+        orm_rows=[],
+    )
+    error_report = BugReport(
+        schema_id=0,
+        query_id=0,
+        schema=None,
+        ir=None,
+        ir_str="",
+        schema_seed=1,
+        query_seed=2,
+        table_data={},
+        rows_per_table=0,
+        use_z3=False,
+        z3_timeout=0,
+        ref_vs_sql=None,
+        ref_vs_orm=None,
+        ref_rows=[],
+        sql_rows=[],
+        orm_rows=[],
+        error="orm unsupported query",
+    )
+
+    assert _report_has_actionable_bug(mismatch_report) is True
+    assert _report_has_actionable_bug(error_report) is True
+
+
 if __name__ == "__main__":
     test_compare_duplicate_projected_columns()
     test_compare_duplicate_projected_numeric_columns()
@@ -270,8 +379,12 @@ if __name__ == "__main__":
     test_ir_generator_null_heavy_can_emit_null_predicates()
     test_sql_translate_uses_is_null_and_is_not_null()
     test_sql_translate_supports_left_join()
+    test_sql_translate_supports_nested_join_chain()
     test_python_ref_null_compare_matches_is_null_semantics()
     test_python_ref_left_join_null_extends_unmatched_rows()
     test_data_gen_null_heavy_raises_null_probability()
     test_ir_generator_groupby_sampling_respects_preferred_pool_size()
+    test_ir_generator_treats_left_join_right_columns_as_query_nullable()
+    test_runner_skips_all_matched_bug_reports()
+    test_runner_keeps_real_mismatches_and_errors()
     print("manual_cases: all checks passed")

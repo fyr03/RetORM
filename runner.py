@@ -144,6 +144,9 @@ class _StatsPrinter(threading.Thread):
             f"  SQL bug   : {s.sql_bugs},  ORM bug   : {s.orm_bugs},  bug 合计  : {bug_total}  ({bug_rate})",
             f"  结构覆盖  : 单表={s.single_table_queries}, Join={s.join_queries}, LEFT JOIN={s.left_join_queries}, Filter={s.filter_queries}, GroupBy={s.groupby_queries}, Having={s.having_queries}, 重复投影={s.duplicate_proj_queries}, NULL谓词={s.null_predicate_queries}",
         ]
+        lines = _format_run_stats_lines(
+            s, elapsed, qpm, pass_rate, empty_rate, error_rate, bug_rate
+        )
         for line in lines:
             self.run_logger.info(line)
 
@@ -190,7 +193,61 @@ class RunStats:
     duplicate_proj_queries: int = 0
     null_predicate_queries: int = 0
     left_join_queries:      int = 0
+    multi_join_queries:     int = 0
+    left_join_null_queries: int = 0
+    left_join_groupby_queries: int = 0
+    left_join_having_queries: int = 0
+    left_join_right_proj_queries: int = 0
+    left_join_right_predicate_queries: int = 0
     bug_reports:   List[BugReport] = field(default_factory=list)
+
+
+def _report_has_actionable_bug(report: BugReport) -> bool:
+    """
+    A report should only be persisted when it represents a real RetORM finding:
+      1. execution error / unsupported query path
+      2. ref vs sql mismatch
+      3. ref vs orm mismatch
+
+    A fully matched three-path result is not a bug and must not be archived.
+    """
+    if report.error:
+        return True
+    if report.ref_vs_sql is None or report.ref_vs_orm is None:
+        return False
+    return (not report.ref_vs_sql.match) or (not report.ref_vs_orm.match)
+
+
+def _persist_bug_report(
+    report: BugReport,
+    stats: RunStats,
+    bug_dir: str,
+    bug_idx: int,
+    dlog,
+) -> int:
+    """
+    Persist a bug report only when it is actionable.
+    This guards against accidental "all matched" bug files while keeping
+    execution errors and result mismatches intact.
+    """
+    if not _report_has_actionable_bug(report):
+        warn = (
+            "[internal warning] skipped non-bug report: "
+            f"schema={report.schema_id + 1}, query={report.query_id + 1}, "
+            "all compared paths matched"
+        )
+        print(warn)
+        dlog(warn)
+        return bug_idx
+
+    bug_idx += 1
+    stats.bug_reports.append(report)
+    fpath = _write_bug_file(report, bug_dir, bug_idx)
+    fpath_detail = _write_bug_detail(report)
+    msg = f"  -> repro script: {fpath}  bug detail: {fpath_detail}"
+    print(msg)
+    dlog(msg)
+    return bug_idx
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +269,8 @@ def _write_bug_detail(report: BugReport) -> str:
     返回写出的文件路径。
     """
     bug_ts = datetime.now().strftime("%y%m%d_%H%M%S_%f")[:-3]  # 精确到毫秒
+    if not _report_has_actionable_bug(report):
+        raise ValueError("attempted to write a non-actionable bug detail")
     os.makedirs("logs_bug", exist_ok=True)
     fpath_detail = f"logs_bug/{bug_ts}.log"
 
@@ -346,6 +405,8 @@ def _write_bug_file(report: BugReport, bug_dir: str, bug_idx: int) -> str:
     把一个 bug 写成可直接运行的 Python 复现脚本。
     返回文件路径。
     """
+    if not _report_has_actionable_bug(report):
+        raise ValueError("attempted to write a non-actionable bug repro script")
     os.makedirs(bug_dir, exist_ok=True)
     fpath = os.path.join(bug_dir, f"bug_{bug_idx:03d}.py")
 
@@ -683,7 +744,6 @@ def run(
                         tb = traceback.format_exc()
                         print(tb); dlog(tb)
                     stats.errors += 1
-                    bug_idx += 1
                     report = BugReport(
                         schema_id=schema_id, query_id=query_id,
                         schema=schema, ir=ir, ir_str=ir_str,
@@ -696,6 +756,10 @@ def run(
                         ref_rows=[], sql_rows=[], orm_rows=[],
                         error=str(e),
                     )
+                    bug_idx = _persist_bug_report(
+                        report, stats, bug_dir, bug_idx, dlog
+                    )
+                    continue
                     stats.bug_reports.append(report)
                     fpath = _write_bug_file(report, bug_dir, bug_idx)
                     fpath_detail = _write_bug_detail(report)
@@ -753,7 +817,6 @@ def run(
                         print(report_str)
                     dlog(report_str)
 
-                    bug_idx += 1
                     report = BugReport(
                         schema_id=schema_id, query_id=query_id,
                         schema=schema, ir=ir, ir_str=ir_str,
@@ -766,6 +829,10 @@ def run(
                         ref_rows=ref_rows, sql_rows=sql_rows, orm_rows=orm_rows,
                         sql_text=sql_text,
                     )
+                    bug_idx = _persist_bug_report(
+                        report, stats, bug_dir, bug_idx, dlog
+                    )
+                    continue
                     stats.bug_reports.append(report)
                     fpath = _write_bug_file(report, bug_dir, bug_idx)
                     fpath_detail = _write_bug_detail(report)
@@ -864,8 +931,20 @@ def _record_query_shape(stats: RunStats, ir) -> None:
         stats.join_queries += 1
     else:
         stats.single_table_queries += 1
+    if features["has_multi_join"]:
+        stats.multi_join_queries += 1
     if features["has_left_join"]:
         stats.left_join_queries += 1
+    if features["has_left_join_null"]:
+        stats.left_join_null_queries += 1
+    if features["has_left_join_groupby"]:
+        stats.left_join_groupby_queries += 1
+    if features["has_left_join_having"]:
+        stats.left_join_having_queries += 1
+    if features["has_left_join_right_projection"]:
+        stats.left_join_right_proj_queries += 1
+    if features["has_left_join_right_predicate"]:
+        stats.left_join_right_predicate_queries += 1
 
     if features["has_filter"]:
         stats.filter_queries += 1
@@ -882,39 +961,73 @@ def _record_query_shape(stats: RunStats, ir) -> None:
 def _collect_query_features(node) -> dict:
     features = {
         "has_join": False,
+        "has_multi_join": False,
         "has_filter": False,
         "has_groupby": False,
         "has_having": False,
         "has_duplicate_projection": False,
         "has_null_predicate": False,
         "has_left_join": False,
+        "has_left_join_null": False,
+        "has_left_join_groupby": False,
+        "has_left_join_having": False,
+        "has_left_join_right_projection": False,
+        "has_left_join_right_predicate": False,
     }
 
-    def visit_condition(cond):
+    join_count = 0
+    left_join_right_aliases = set()
+
+    def collect_aliases(cur):
+        if isinstance(cur, Scan):
+            return {cur.alias}
+        if isinstance(cur, Join):
+            return collect_aliases(cur.left) | collect_aliases(cur.right)
+        if isinstance(cur, Filter):
+            return collect_aliases(cur.child)
+        if isinstance(cur, GroupBy):
+            return collect_aliases(cur.child)
+        if isinstance(cur, Having):
+            return collect_aliases(cur.child)
+        if isinstance(cur, Project):
+            return collect_aliases(cur.child)
+        return set()
+
+    def field_uses_left_join_right(field_name: str) -> bool:
+        if not isinstance(field_name, str) or "." not in field_name:
+            return False
+        return field_name.split(".", 1)[0] in left_join_right_aliases
+
+    def visit_condition(cond, track_right_usage=False):
         if isinstance(cond, Compare):
             if cond.value is None:
                 features["has_null_predicate"] = True
+            if track_right_usage and field_uses_left_join_right(cond.field):
+                features["has_left_join_right_predicate"] = True
             return
         if isinstance(cond, And) or isinstance(cond, Or):
-            visit_condition(cond.left)
-            visit_condition(cond.right)
+            visit_condition(cond.left, track_right_usage)
+            visit_condition(cond.right, track_right_usage)
             return
         if isinstance(cond, Not):
-            visit_condition(cond.child)
+            visit_condition(cond.child, track_right_usage)
 
     def visit(cur):
+        nonlocal join_count
         if isinstance(cur, Join):
-            visit_condition(cur.on)
+            join_count += 1
+            visit_condition(cur.on, track_right_usage=False)
             features["has_join"] = True
             if cur.join_type == JoinType.LEFT:
                 features["has_left_join"] = True
+                left_join_right_aliases.update(collect_aliases(cur.right))
             visit(cur.left)
             visit(cur.right)
             return
         if isinstance(cur, Filter):
             features["has_filter"] = True
-            visit_condition(cur.condition)
             visit(cur.child)
+            visit_condition(cur.condition, track_right_usage=True)
             return
         if isinstance(cur, GroupBy):
             features["has_groupby"] = True
@@ -922,23 +1035,48 @@ def _collect_query_features(node) -> dict:
             return
         if isinstance(cur, Having):
             features["has_having"] = True
-            visit_condition(cur.condition)
             visit(cur.child)
+            visit_condition(cur.condition, track_right_usage=True)
             return
         if isinstance(cur, Project):
+            visit(cur.child)
             short_names = [_short_field_name(field) for field in cur.fields]
             features["has_duplicate_projection"] = len(short_names) != len(set(short_names))
-            visit(cur.child)
+            if any(field_uses_left_join_right(field) for field in cur.fields):
+                features["has_left_join_right_projection"] = True
             return
         if isinstance(cur, Scan):
             return
 
     visit(node)
+    features["has_multi_join"] = join_count >= 2
+    features["has_left_join_null"] = features["has_left_join"] and features["has_null_predicate"]
+    features["has_left_join_groupby"] = features["has_left_join"] and features["has_groupby"]
+    features["has_left_join_having"] = features["has_left_join"] and features["has_having"]
     return features
 
 
 def _short_field_name(field_name: str) -> str:
     return field_name.split(".", 1)[1] if "." in field_name else field_name
+
+
+def _format_run_stats_lines(
+    stats: RunStats,
+    elapsed: int,
+    qpm: str,
+    pass_rate: str,
+    empty_rate: str,
+    error_rate: str,
+    bug_rate: str,
+) -> List[str]:
+    bug_total = stats.sql_bugs + stats.orm_bugs
+    return [
+        f"[running log]  time={elapsed}s  speed={qpm} q/min , query  : {stats.total_queries}",
+        f"  passed      : {stats.passed}  ({pass_rate}),  empty results   : {stats.empty_results}  ({empty_rate}),  errors  : {stats.errors}  ({error_rate})",
+        f"  SQL bug   : {stats.sql_bugs},  ORM bug   : {stats.orm_bugs},  bug total  : {bug_total}  ({bug_rate})",
+        f"  structure coverage  : single table={stats.single_table_queries}, join={stats.join_queries}, multi join={stats.multi_join_queries}, left join={stats.left_join_queries}, filter={stats.filter_queries}, group by={stats.groupby_queries}, having={stats.having_queries}, duplicate projection={stats.duplicate_proj_queries}, null predicate={stats.null_predicate_queries}",
+        f"  left join combinations  : LEFT+NULL={stats.left_join_null_queries}, LEFT+GroupBy={stats.left_join_groupby_queries}, LEFT+Having={stats.left_join_having_queries}, LEFT+right projection={stats.left_join_right_proj_queries}, LEFT+right predicate={stats.left_join_right_predicate_queries}",
+    ]
 
 
 def _print_final_report(stats: RunStats, bug_dir: str = "bugs") -> None:
@@ -949,16 +1087,23 @@ def _print_final_report(stats: RunStats, bug_dir: str = "bugs") -> None:
     print(f"  空结果      : {stats.empty_results}")
     print(f"  执行错误    : {stats.errors}")
     print(f"  SQL 翻译 bug: {stats.sql_bugs}")
-    print(f"  ORM bug     : {stats.orm_bugs}  ← 重点关注")
-    print("  结构覆盖    :")
-    print(f"    单表      : {stats.single_table_queries}")
+    print(f"  ORM bug     : {stats.orm_bugs}")
+    print("  Structure Coverage    :")
+    print(f"    single table      : {stats.single_table_queries}")
     print(f"    Join      : {stats.join_queries}")
+    print(f"    MULTI_Join : {stats.multi_join_queries}")
     print(f"    LEFT JOIN : {stats.left_join_queries}")
     print(f"    Filter    : {stats.filter_queries}")
     print(f"    GroupBy   : {stats.groupby_queries}")
     print(f"    Having    : {stats.having_queries}")
-    print(f"    重复投影  : {stats.duplicate_proj_queries}")
-    print(f"    NULL谓词   : {stats.null_predicate_queries}")
+    print(f"    duplicate_proj_queries  : {stats.duplicate_proj_queries}")
+    print(f"    NULL Pred   : {stats.null_predicate_queries}")
+    print("  left join combinations    :")
+    print(f"    LEFT+NULL : {stats.left_join_null_queries}")
+    print(f"    LEFT+GB   : {stats.left_join_groupby_queries}")
+    print(f"    LEFT+HAV  : {stats.left_join_having_queries}")
+    print(f"    LEFT+Proj : {stats.left_join_right_proj_queries}")
+    print(f"    LEFT+Pred : {stats.left_join_right_predicate_queries}")
     print("=" * 60)
 
     if not stats.bug_reports:
