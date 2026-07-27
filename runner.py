@@ -218,6 +218,33 @@ def _report_has_actionable_bug(report: BugReport) -> bool:
     return (not report.ref_vs_sql.match) or (not report.ref_vs_orm.match)
 
 
+def _classify_bug_report(report: BugReport) -> tuple[str, str]:
+    """
+    Classify a bug report without relying on CompareResult truthiness.
+    CompareResult.__bool__ returns ``match``, so boolean checks can invert the
+    intended control flow for mismatches.
+    """
+    if report.error:
+        return "鎵ц寮傚父", report.error
+
+    ref_vs_sql = report.ref_vs_sql
+    ref_vs_orm = report.ref_vs_orm
+    sql_mismatch = ref_vs_sql is not None and not ref_vs_sql.match
+    orm_mismatch = ref_vs_orm is not None and not ref_vs_orm.match
+
+    if sql_mismatch and orm_mismatch:
+        reason = (
+            f"ref_vs_sql: {ref_vs_sql.reason} | "
+            f"ref_vs_orm: {ref_vs_orm.reason}"
+        )
+        return "ref 璺緞鍙兘鏈?bug锛坮ef vs sql 鍜?ref vs orm 鍧囦笉涓€鑷达級", reason
+    if sql_mismatch:
+        return "SQL 缈昏瘧鍣?bug", ref_vs_sql.reason
+    if orm_mismatch:
+        return "ORM bug", ref_vs_orm.reason
+    return "鏈煡锛堜笁璺潎涓€鑷达紝涓嶅簲鍑虹幇锛?", ""
+
+
 def _persist_bug_report(
     report: BugReport,
     stats: RunStats,
@@ -290,15 +317,15 @@ def _write_bug_detail(report: BugReport) -> str:
     if report.error:
         bug_type = "执行异常"
         reason   = report.error
-    elif (report.ref_vs_sql and not report.ref_vs_sql.match and
-          report.ref_vs_orm and not report.ref_vs_orm.match):
+    elif (report.ref_vs_sql is not None and not report.ref_vs_sql.match and
+          report.ref_vs_orm is not None and not report.ref_vs_orm.match):
         bug_type = "ref 路径可能有 bug（ref vs sql 和 ref vs orm 均不一致）"
         reason   = (f"ref_vs_sql: {report.ref_vs_sql.reason} | "
                     f"ref_vs_orm: {report.ref_vs_orm.reason}")
-    elif report.ref_vs_sql and not report.ref_vs_sql.match:
+    elif report.ref_vs_sql is not None and not report.ref_vs_sql.match:
         bug_type = "SQL 翻译器 bug"
         reason   = report.ref_vs_sql.reason
-    elif report.ref_vs_orm and not report.ref_vs_orm.match:
+    elif report.ref_vs_orm is not None and not report.ref_vs_orm.match:
         bug_type = "ORM bug"
         reason   = report.ref_vs_orm.reason
     else:
@@ -375,9 +402,9 @@ def _write_bug_detail(report: BugReport) -> str:
         "",
     ]
 
-    if report.ref_vs_sql and not report.ref_vs_sql.match:
+    if report.ref_vs_sql is not None and not report.ref_vs_sql.match:
         lines.append(f"  ref vs sql 不一致: {report.ref_vs_sql.reason}")
-    if report.ref_vs_orm and not report.ref_vs_orm.match:
+    if report.ref_vs_orm is not None and not report.ref_vs_orm.match:
         lines.append(f"  ref vs orm 不一致: {report.ref_vs_orm.reason}")
 
     lines.append(sep)
@@ -414,15 +441,15 @@ def _write_bug_file(report: BugReport, bug_dir: str, bug_idx: int) -> str:
     if report.error:
         bug_type = "执行异常"
         reason   = report.error
-    elif (report.ref_vs_sql and not report.ref_vs_sql.match and
-          report.ref_vs_orm and not report.ref_vs_orm.match):
+    elif (report.ref_vs_sql is not None and not report.ref_vs_sql.match and
+          report.ref_vs_orm is not None and not report.ref_vs_orm.match):
         bug_type = "ref 路径可能有 bug（ref vs sql 和 ref vs orm 均不一致）"
         reason   = (f"ref_vs_sql: {report.ref_vs_sql.reason} | "
                     f"ref_vs_orm: {report.ref_vs_orm.reason}")
-    elif report.ref_vs_sql and not report.ref_vs_sql.match:
+    elif report.ref_vs_sql is not None and not report.ref_vs_sql.match:
         bug_type = "SQL 翻译器 bug"
         reason   = report.ref_vs_sql.reason
-    elif report.ref_vs_orm and not report.ref_vs_orm.match:
+    elif report.ref_vs_orm is not None and not report.ref_vs_orm.match:
         bug_type = "ORM bug ⚠️"
         reason   = report.ref_vs_orm.reason
     else:
@@ -591,6 +618,7 @@ def run(
     queries_per_schema: int   = config.QUERIES_PER_SCHEMA,
     num_tables:         int   = 2,
     cols_per_table:     int   = 3,
+    rows_per_table:     int   = config.RANDOM_ROWS,
     use_z3:             bool  = True,
     seed:               Optional[int] = None,
     verbose:            bool  = False,
@@ -615,9 +643,9 @@ def run(
         f"{'=' * 60}\n"
         f"RetORM 差分测试启动  [{run_ts}]\n"
         f"  schemas={num_schemas}, queries/schema={queries_per_schema}\n"
-        f"  tables={num_tables}, cols={cols_per_table}\n"
+        f"  tables={num_tables}, cols={cols_per_table}, base_rows={rows_per_table}\n"
         f"  use_z3={use_z3}, seed={seed}\n"
-        f"  detail_log=detail_logs/{run_ts}.log\n"
+        f"  detail_log=logs_detail/{run_ts}.log\n"
         f"  run_log=logs/{run_ts}.log\n"
         f"{'=' * 60}"
     )
@@ -628,7 +656,12 @@ def run(
     run_logger.info(f"  schemas={num_schemas}  queries/schema={queries_per_schema}")
     run_logger.info(f"  tables={num_tables}  cols/table={cols_per_table}")
     run_logger.info(f"  use_z3={use_z3}  seed={seed}")
-    run_logger.info(f"  RANDOM_ROWS={config.RANDOM_ROWS}  Z3_TIMEOUT={config.Z3_TIMEOUT_SEC}s")
+    run_logger.info(
+        "  row budget  : "
+        f"base={rows_per_table}  extra_random={config.EXTRA_RANDOM_ROWS}  "
+        f"edge={config.EDGE_ROWS}  adversarial={config.ADVERSARIAL_ROWS}"
+    )
+    run_logger.info(f"  Z3_TIMEOUT={config.Z3_TIMEOUT_SEC}s")
     run_logger.info(f"  detail_log : logs_detail/{run_ts}.log")
     run_logger.info(f"  bug_detail : logs_bug/<bug_ts>.log")
     run_logger.info("=" * 50)
@@ -679,7 +712,7 @@ def run(
                 query_seed = schema_seed + query_id + 1
                 stats.total_queries += 1
                 table_data = {}
-                stress_mode = _choose_stress_mode(query_seed)
+                stress_mode = _choose_stress_mode(query_seed, stats)
 
                 prefix = (
                     f"\n  Query {query_id + 1}/{queries_per_schema}  "
@@ -708,7 +741,7 @@ def run(
                     _truncate_schema(schema)
                     table_data = generate_and_insert(
                         schema, ir,
-                        rows_per_table=config.RANDOM_ROWS,
+                        rows_per_table=rows_per_table,
                         use_z3=use_z3,
                         z3_timeout=config.Z3_TIMEOUT_SEC,
                         stress_mode=stress_mode,
@@ -749,7 +782,7 @@ def run(
                         schema=schema, ir=ir, ir_str=ir_str,
                         schema_seed=schema_seed, query_seed=query_seed,
                         table_data=table_data,
-                        rows_per_table=config.RANDOM_ROWS,
+                        rows_per_table=rows_per_table,
                         use_z3=use_z3,
                         z3_timeout=config.Z3_TIMEOUT_SEC,
                         ref_vs_sql=None, ref_vs_orm=None,
@@ -822,7 +855,7 @@ def run(
                         schema=schema, ir=ir, ir_str=ir_str,
                         schema_seed=schema_seed, query_seed=query_seed,
                         table_data=table_data,
-                        rows_per_table=config.RANDOM_ROWS,
+                        rows_per_table=rows_per_table,
                         use_z3=use_z3,
                         z3_timeout=config.Z3_TIMEOUT_SEC,
                         ref_vs_sql=ref_vs_sql, ref_vs_orm=ref_vs_orm,
@@ -909,7 +942,7 @@ def _truncate_schema(schema: Schema) -> None:
         execute_sql(f"TRUNCATE TABLE `{tname}`;")
 
 
-def _choose_stress_mode(query_seed: int) -> str:
+def _choose_stress_mode_legacy(query_seed: int) -> str:
     """基于 query_seed 可复现地选择一个压力模式。"""
     rng = random.Random(query_seed ^ 0x5F3759DF)
     roll = rng.random()
@@ -1120,15 +1153,15 @@ def _print_final_report(stats: RunStats, bug_dir: str = "bugs") -> None:
             print(f"  类型: 执行异常")
             print(f"  错误: {r.error}")
         else:
-            if (r.ref_vs_sql and not r.ref_vs_sql.match and
-                    r.ref_vs_orm and not r.ref_vs_orm.match):
+            if (r.ref_vs_sql is not None and not r.ref_vs_sql.match and
+                    r.ref_vs_orm is not None and not r.ref_vs_orm.match):
                 print(f"  类型: ref 路径可能有 bug")
                 print(f"  原因(sql): {r.ref_vs_sql.reason}")
                 print(f"  原因(orm): {r.ref_vs_orm.reason}")
-            elif r.ref_vs_sql and not r.ref_vs_sql.match:
+            elif r.ref_vs_sql is not None and not r.ref_vs_sql.match:
                 print(f"  类型: SQL 翻译器 bug")
                 print(f"  原因: {r.ref_vs_sql.reason}")
-            elif r.ref_vs_orm and not r.ref_vs_orm.match:
+            elif r.ref_vs_orm is not None and not r.ref_vs_orm.match:
                 print(f"  类型: ORM bug ⚠️")
                 print(f"  原因: {r.ref_vs_orm.reason}")
             print(f"  ref ({len(r.ref_rows)}行): {r.ref_rows[:3]}"
@@ -1141,6 +1174,54 @@ def _print_final_report(stats: RunStats, bug_dir: str = "bugs") -> None:
         print(f"  复现: {os.path.join(bug_dir, f'bug_{i+1:03d}.py')}")
 
 
+def _choose_stress_mode(query_seed: int, stats: Optional[RunStats] = None) -> str:
+    """Use deterministic weighted sampling and boost under-covered structures."""
+    rng = random.Random(query_seed ^ 0x5F3759DF)
+    weights = {
+        "balanced": 1.8,
+        "join_heavy": 1.0,
+        "groupby_heavy": 1.0,
+        "duplicate_column_heavy": 0.9,
+        "null_heavy": 0.9,
+    }
+
+    if stats is not None and stats.total_queries > 0:
+        total = stats.total_queries
+
+        def deficit(actual: int, target_ratio: float) -> float:
+            target_count = max(1.0, total * target_ratio)
+            return max(0.0, (target_count - actual) / target_count)
+
+        join_gap = deficit(stats.join_queries, 0.5)
+        multi_join_gap = deficit(stats.multi_join_queries, 0.12)
+        left_join_gap = deficit(stats.left_join_queries, 0.08)
+        groupby_gap = deficit(stats.groupby_queries, 0.45)
+        having_gap = deficit(stats.having_queries, 0.3)
+        duplicate_gap = deficit(stats.duplicate_proj_queries, 0.12)
+        null_gap = deficit(stats.null_predicate_queries, 0.08)
+        left_combo_gap = deficit(stats.left_join_null_queries, 0.025)
+        right_proj_gap = deficit(stats.left_join_right_proj_queries, 0.04)
+
+        weights["join_heavy"] += 2.6 * join_gap + 2.2 * multi_join_gap + 1.6 * right_proj_gap
+        weights["groupby_heavy"] += 2.8 * groupby_gap + 1.8 * having_gap
+        weights["duplicate_column_heavy"] += 3.4 * duplicate_gap
+        weights["null_heavy"] += 2.6 * null_gap + 2.2 * left_join_gap + 1.8 * left_combo_gap
+
+        if total < 50:
+            weights["balanced"] *= 0.7
+            weights["join_heavy"] += 0.6
+            weights["groupby_heavy"] += 0.4
+
+    total_weight = sum(weights.values())
+    roll = rng.random() * total_weight
+    upto = 0.0
+    for mode, weight in weights.items():
+        upto += weight
+        if roll <= upto:
+            return mode
+    return "balanced"
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1151,6 +1232,7 @@ def _parse_args():
     parser.add_argument("--queries",  type=int,  default=config.QUERIES_PER_SCHEMA)
     parser.add_argument("--tables",   type=int,  default=2)
     parser.add_argument("--cols",     type=int,  default=3)
+    parser.add_argument("--rows",     type=int,  default=config.RANDOM_ROWS)
     parser.add_argument("--seed",     type=int,  default=None)
     parser.add_argument("--no-z3",   action="store_true")
     parser.add_argument("--verbose",  action="store_true")
@@ -1164,6 +1246,7 @@ if __name__ == "__main__":
         queries_per_schema = args.queries,
         num_tables         = args.tables,
         cols_per_table     = args.cols,
+        rows_per_table     = args.rows,
         use_z3             = not args.no_z3,
         seed               = args.seed,
         verbose            = args.verbose,

@@ -12,11 +12,12 @@ import os
 import random
 import sys
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from generator.schema_gen import Column, ColType, ForeignKey, Schema, TableSchema
+import config
+from generator.schema_gen import ColType, ForeignKey, Schema, TableSchema
 from ir.nodes import (
     AggFunc,
     Aggregate,
@@ -57,47 +58,91 @@ def generate_ir(
     stress_mode: Optional[str] = None,
     seed: Optional[int] = None,
 ) -> Tuple[QueryNode, GenContext]:
-    if seed is not None:
-        random.seed(seed)
     stress_mode = stress_mode or "balanced"
-
-    join_prob, filter_prob, groupby_prob, having_prob = _apply_stress_mode(
-        stress_mode, join_prob, filter_prob, groupby_prob, having_prob
+    template = _build_stress_template(schema, stress_mode)
+    retry_budget = (
+        max(1, config.STRESS_RETRY_BUDGET)
+        if stress_mode != "balanced"
+        else 2
     )
 
-    main_table = random.choice(schema.tables)
+    last_result = None
+    for attempt in range(retry_budget):
+        if seed is not None:
+            random.seed(seed + attempt * 9973)
+        join_p, filter_p, groupby_p, having_p = _apply_stress_mode(
+            stress_mode, join_prob, filter_prob, groupby_prob, having_prob
+        )
+        result = _generate_ir_once(
+            schema,
+            join_p,
+            filter_p,
+            groupby_p,
+            having_p,
+            stress_mode,
+            template,
+        )
+        last_result = result
+        ir, ctx = result
+        if _ir_satisfies_stress_mode(ir, ctx, stress_mode, template):
+            return result
+
+    return last_result
+
+
+def _generate_ir_once(
+    schema: Schema,
+    join_prob: float,
+    filter_prob: float,
+    groupby_prob: float,
+    having_prob: float,
+    stress_mode: str,
+    template: Dict[str, object],
+) -> Tuple[QueryNode, GenContext]:
+    main_table = _choose_main_table(schema, stress_mode, template)
     main_alias = main_table.name[0]
     node: QueryNode = Scan(main_table.name, main_alias)
 
     ctx = GenContext()
     _add_table_to_ctx(ctx, main_table, main_alias)
 
-    joined = False
     joined_table_names = {main_table.name}
     used_aliases = {main_alias}
     join_step = 0
+    target_joins = _target_join_count(schema, stress_mode, template)
 
     while len(joined_table_names) < len(schema.tables):
         candidates = _find_join_extensions(schema, joined_table_names)
         if not candidates:
             break
 
-        if join_step == 0:
-            if random.random() >= join_prob:
-                break
-        elif random.random() >= _extra_join_prob(stress_mode, join_step):
+        must_take = join_step < target_joins
+        step_prob = join_prob if join_step == 0 else _extra_join_prob(stress_mode, join_step)
+        if not must_take and random.random() >= step_prob:
             break
 
-        extension = _choose_join_extension(candidates, stress_mode)
+        extension = _choose_join_extension(
+            candidates,
+            stress_mode,
+            template=template,
+            join_step=join_step,
+            target_joins=target_joins,
+        )
         existing_alias = _find_alias_for_table(ctx, extension["existing_table"])
         join_table = schema.get_table(extension["new_table"])
         if existing_alias is None or join_table is None:
             break
 
         join_alias = _make_unique_alias(join_table.name[0], used_aliases)
+        want_left_join = (
+            bool(template.get("force_left_join"))
+            and not ctx.left_join_right_aliases
+            and extension["left_join_safe"]
+        )
         join_type = _choose_join_type(
             stress_mode,
             allow_left=extension["left_join_safe"],
+            force_left=want_left_join,
         )
         on_cond = _make_fk_condition_for_extension(
             extension["fk"],
@@ -121,35 +166,50 @@ def generate_ir(
             mark_left_join_right=(join_type == JoinType.LEFT),
         )
 
-        joined = True
         joined_table_names.add(join_table.name)
         used_aliases.add(join_alias)
         join_step += 1
 
-    effective_filter_prob = min(1.0, filter_prob + 0.15) if joined else filter_prob
-    if ctx.visible_cols and random.random() < effective_filter_prob:
-        cond = _generate_condition(ctx, schema, stress_mode=stress_mode)
+    effective_filter_prob = min(1.0, filter_prob + 0.15) if join_step else filter_prob
+    should_filter = bool(template.get("require_filter"))
+    if not should_filter:
+        should_filter = bool(ctx.visible_cols) and random.random() < effective_filter_prob
+    if ctx.visible_cols and should_filter:
+        cond = _generate_condition(
+            ctx,
+            schema,
+            stress_mode=stress_mode,
+            template=template,
+        )
         if cond is not None:
             node = Filter(condition=cond, child=node)
 
-    effective_groupby_prob = min(1.0, groupby_prob + 0.2) if joined else groupby_prob
-    if ctx.visible_cols and random.random() < effective_groupby_prob:
+    effective_groupby_prob = min(1.0, groupby_prob + 0.2) if join_step else groupby_prob
+    should_groupby = bool(template.get("require_groupby"))
+    if not should_groupby:
+        should_groupby = bool(ctx.visible_cols) and random.random() < effective_groupby_prob
+    if ctx.visible_cols and should_groupby:
         numeric_cols = _get_numeric_cols(ctx)
         all_cols = ctx.visible_cols
 
-        group_fields = _choose_group_fields(ctx, stress_mode, all_cols)
+        group_fields = _choose_group_fields(ctx, stress_mode, all_cols, template=template)
         if not group_fields:
             group_fields = all_cols[:1]
 
         agg_cols = _get_preferred_agg_cols(ctx, stress_mode, numeric_cols, all_cols)
-        num_aggs = random.randint(1, min(2, len(agg_cols)))
+        if not agg_cols:
+            agg_cols = all_cols
+
+        min_aggs = min(max(1, int(template.get("min_aggs", 1))), len(agg_cols))
+        max_aggs = min(max(min_aggs, int(template.get("max_aggs", 2))), len(agg_cols))
+        num_aggs = min_aggs if min_aggs == max_aggs else random.randint(min_aggs, max_aggs)
+
         agg_list = []
         used_agg_aliases = set()
-
         for _ in range(num_aggs):
             agg_col = random.choice(agg_cols)
-            agg_func = _choose_agg_func(stress_mode, agg_col, ctx)
-            agg_field = "*" if agg_func == AggFunc.COUNT else agg_col
+            agg_func = _choose_agg_func(stress_mode, agg_col, ctx, template=template)
+            agg_field = _choose_agg_field(agg_func, agg_col, ctx, template=template)
 
             base_alias = (
                 f"{agg_func.value.lower()}_"
@@ -168,17 +228,250 @@ def generate_ir(
         ctx.group_fields = group_fields
         ctx.agg_aliases = [agg.alias for agg in agg_list]
 
-        effective_having_prob = min(1.0, having_prob + 0.1) if joined else having_prob
-        if ctx.agg_aliases and random.random() < effective_having_prob:
-            having_cond = _generate_having_condition(ctx, stress_mode=stress_mode)
+        effective_having_prob = min(1.0, having_prob + 0.1) if join_step else having_prob
+        should_having = bool(template.get("require_having"))
+        if not should_having:
+            should_having = bool(ctx.agg_aliases) and random.random() < effective_having_prob
+        if ctx.agg_aliases and should_having:
+            having_cond = _generate_having_condition(
+                ctx,
+                stress_mode=stress_mode,
+                template=template,
+            )
             if having_cond is not None:
                 node = Having(condition=having_cond, child=node)
 
-    project_fields = _choose_project_fields(ctx, stress_mode=stress_mode)
+    project_fields = _choose_project_fields(ctx, stress_mode=stress_mode, template=template)
     if project_fields:
         node = Project(fields=project_fields, child=node)
 
     return node, ctx
+
+
+def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object]:
+    can_join = bool(schema.fk_pairs())
+    can_multi_join = len(schema.tables) >= 3 and len(schema.fk_pairs()) >= 2
+    ref_tables = {fk.ref_table for fk in schema.fk_pairs()}
+
+    template: Dict[str, object] = {
+        "target_joins": 0,
+        "require_filter": False,
+        "require_groupby": False,
+        "require_having": False,
+        "force_left_join": False,
+        "force_null_compare": False,
+        "force_right_projection": False,
+        "force_duplicate_projection": False,
+        "min_aggs": 1,
+        "max_aggs": 2,
+        "count_field_prob": 0.18,
+        "prefer_nullable_agg_field": False,
+        "ref_tables": ref_tables,
+    }
+
+    if stress_mode == "join_heavy":
+        template.update(
+            {
+                "target_joins": 2 if can_multi_join else (1 if can_join else 0),
+                "require_filter": True,
+                "force_right_projection": can_join,
+                "min_aggs": 1,
+                "max_aggs": 2,
+                "count_field_prob": 0.25,
+            }
+        )
+    elif stress_mode == "groupby_heavy":
+        template.update(
+            {
+                "target_joins": 1 if can_join and len(schema.tables) >= 2 else 0,
+                "require_filter": True,
+                "require_groupby": True,
+                "require_having": True,
+                "min_aggs": 2,
+                "max_aggs": 3,
+                "count_field_prob": 0.45,
+                "prefer_nullable_agg_field": True,
+            }
+        )
+    elif stress_mode == "duplicate_column_heavy":
+        template.update(
+            {
+                "target_joins": 1 if can_join else 0,
+                "force_duplicate_projection": True,
+                "count_field_prob": 0.22,
+            }
+        )
+    elif stress_mode == "null_heavy":
+        template.update(
+            {
+                "target_joins": 1 if can_join else 0,
+                "require_filter": True,
+                "force_left_join": bool(ref_tables),
+                "force_null_compare": True,
+                "force_right_projection": can_join,
+                "require_groupby": can_join and len(schema.tables) >= 2,
+                "require_having": False,
+                "min_aggs": 1,
+                "max_aggs": 2,
+                "count_field_prob": 0.35,
+                "prefer_nullable_agg_field": True,
+            }
+        )
+
+    return template
+
+
+def _ir_satisfies_stress_mode(
+    ir: QueryNode,
+    ctx: GenContext,
+    stress_mode: str,
+    template: Dict[str, object],
+) -> bool:
+    if stress_mode == "balanced":
+        return True
+
+    features = _collect_ir_features(ir)
+
+    if features["join_count"] < int(template.get("target_joins", 0)):
+        return False
+    if template.get("force_left_join") and not features["has_left_join"]:
+        return False
+    if template.get("require_groupby") and not features["has_groupby"]:
+        return False
+    if template.get("require_having") and not features["has_having"]:
+        return False
+    if template.get("force_null_compare") and not features["has_null_predicate"]:
+        return False
+    if template.get("force_right_projection") and ctx.left_join_right_aliases:
+        if not features["has_left_join_right_projection"]:
+            return False
+    if template.get("force_duplicate_projection") and not features["has_duplicate_projection"]:
+        return False
+
+    if stress_mode == "join_heavy":
+        return features["has_join"]
+    if stress_mode == "groupby_heavy":
+        return features["has_groupby"] and features["has_having"]
+    if stress_mode == "duplicate_column_heavy":
+        return features["has_duplicate_projection"]
+    if stress_mode == "null_heavy":
+        if template.get("force_left_join") and not features["has_left_join"]:
+            return False
+        return features["has_null_predicate"]
+    return True
+
+
+def _collect_ir_features(node: QueryNode) -> Dict[str, object]:
+    features = {
+        "join_count": 0,
+        "has_join": False,
+        "has_left_join": False,
+        "has_groupby": False,
+        "has_having": False,
+        "has_null_predicate": False,
+        "has_duplicate_projection": False,
+        "has_left_join_right_projection": False,
+    }
+    left_join_right_aliases = set()
+
+    def collect_aliases(cur: QueryNode) -> set:
+        if isinstance(cur, Scan):
+            return {cur.alias}
+        if isinstance(cur, Join):
+            return collect_aliases(cur.left) | collect_aliases(cur.right)
+        if hasattr(cur, "child"):
+            return collect_aliases(cur.child)
+        return set()
+
+    def field_uses_left_join_right(field_name: str) -> bool:
+        return isinstance(field_name, str) and "." in field_name and (
+            field_name.split(".", 1)[0] in left_join_right_aliases
+        )
+
+    def visit_condition(cond: Condition) -> None:
+        if isinstance(cond, Compare):
+            if cond.value is None:
+                features["has_null_predicate"] = True
+            return
+        if isinstance(cond, (And, Or)):
+            visit_condition(cond.left)
+            visit_condition(cond.right)
+            return
+        if isinstance(cond, Not):
+            visit_condition(cond.child)
+
+    def visit(cur: QueryNode) -> None:
+        if isinstance(cur, Join):
+            features["has_join"] = True
+            features["join_count"] += 1
+            visit_condition(cur.on)
+            if cur.join_type == JoinType.LEFT:
+                features["has_left_join"] = True
+                left_join_right_aliases.update(collect_aliases(cur.right))
+            visit(cur.left)
+            visit(cur.right)
+            return
+        if isinstance(cur, Filter):
+            visit_condition(cur.condition)
+            visit(cur.child)
+            return
+        if isinstance(cur, GroupBy):
+            features["has_groupby"] = True
+            visit(cur.child)
+            return
+        if isinstance(cur, Having):
+            features["has_having"] = True
+            visit_condition(cur.condition)
+            visit(cur.child)
+            return
+        if isinstance(cur, Project):
+            short_names = [_short_field_name(field) for field in cur.fields]
+            features["has_duplicate_projection"] = len(short_names) != len(set(short_names))
+            if any(field_uses_left_join_right(field) for field in cur.fields):
+                features["has_left_join_right_projection"] = True
+            visit(cur.child)
+
+    visit(node)
+    return features
+
+
+def _choose_main_table(
+    schema: Schema,
+    stress_mode: str,
+    template: Dict[str, object],
+) -> TableSchema:
+    if stress_mode == "null_heavy":
+        ref_tables = template.get("ref_tables", set())
+        candidates = [table for table in schema.tables if table.name in ref_tables]
+        if candidates:
+            return random.choice(candidates)
+
+    if stress_mode in ("join_heavy", "groupby_heavy", "duplicate_column_heavy"):
+        scored = []
+        for table in schema.tables:
+            degree = 0
+            for fk in schema.fk_pairs():
+                if fk.src_table == table.name or fk.ref_table == table.name:
+                    degree += 1
+            scored.append((degree, table))
+        best_degree = max(score for score, _ in scored)
+        if best_degree > 0:
+            candidates = [table for score, table in scored if score == best_degree]
+            return random.choice(candidates)
+
+    return random.choice(schema.tables)
+
+
+def _target_join_count(
+    schema: Schema,
+    stress_mode: str,
+    template: Dict[str, object],
+) -> int:
+    max_join_chain = max(0, len(schema.tables) - 1)
+    target = min(int(template.get("target_joins", 0)), max_join_chain)
+    if stress_mode == "join_heavy" and target == 0 and schema.fk_pairs():
+        return 1
+    return target
 
 
 def _add_table_to_ctx(
@@ -342,25 +635,51 @@ def _make_unique_alias(base: str, used_aliases: set) -> str:
     return alias
 
 
-def _choose_join_extension(candidates: List[dict], stress_mode: str) -> dict:
+def _choose_join_extension(
+    candidates: List[dict],
+    stress_mode: str,
+    template: Optional[Dict[str, object]] = None,
+    join_step: int = 0,
+    target_joins: int = 0,
+) -> dict:
+    if template and template.get("force_left_join") and join_step == 0:
+        preferred = [c for c in candidates if c["left_join_safe"]]
+        if preferred:
+            candidates = preferred
+
     if stress_mode in ("join_heavy", "null_heavy"):
         preferred = [c for c in candidates if c["left_join_safe"]]
         if preferred and random.random() < 0.75:
             candidates = preferred
+
+    if target_joins >= 2 and join_step == 0:
+        bridging = [
+            c
+            for c in candidates
+            if sum(
+                1
+                for other in candidates
+                if other["new_table"] != c["new_table"]
+            )
+            >= 1
+        ]
+        if bridging:
+            candidates = bridging
+
     return random.choice(candidates)
 
 
 def _extra_join_prob(stress_mode: str, join_step: int) -> float:
     base = 0.28
     if stress_mode == "join_heavy":
-        base = 0.72
+        base = 0.78
     elif stress_mode == "null_heavy":
-        base = 0.62
+        base = 0.7
     elif stress_mode == "groupby_heavy":
-        base = 0.48
+        base = 0.5
     elif stress_mode == "duplicate_column_heavy":
-        base = 0.4
-    return max(0.15, base - join_step * 0.12)
+        base = 0.42
+    return max(0.15, base - join_step * 0.1)
 
 
 def _generate_condition(
@@ -368,6 +687,7 @@ def _generate_condition(
     schema: Schema,
     depth: int = 0,
     stress_mode: str = "balanced",
+    template: Optional[Dict[str, object]] = None,
 ) -> Optional[Condition]:
     numeric_cols = _get_numeric_cols(ctx)
     nullable_numeric_cols = _get_nullable_numeric_cols(ctx)
@@ -377,6 +697,19 @@ def _generate_condition(
 
     if not numeric_cols and not nullable_visible_cols:
         return None
+
+    if template and template.get("force_null_compare") and nullable_visible_cols:
+        forced = _make_compare(
+            numeric_cols,
+            nullable_numeric_cols,
+            nullable_visible_cols,
+            left_join_right_numeric_cols,
+            left_join_right_visible_cols,
+            stress_mode,
+            force_null=True,
+        )
+        if forced is not None:
+            return forced
 
     if depth >= 2:
         return _make_compare(
@@ -389,7 +722,7 @@ def _generate_condition(
         )
 
     roll = random.random()
-    if roll < 0.6:
+    if roll < 0.55:
         return _make_compare(
             numeric_cols,
             nullable_numeric_cols,
@@ -398,15 +731,15 @@ def _generate_condition(
             left_join_right_visible_cols,
             stress_mode,
         )
-    if roll < 0.8:
-        left = _generate_condition(ctx, schema, depth + 1, stress_mode)
-        right = _generate_condition(ctx, schema, depth + 1, stress_mode)
+    if roll < 0.78:
+        left = _generate_condition(ctx, schema, depth + 1, stress_mode, template=template)
+        right = _generate_condition(ctx, schema, depth + 1, stress_mode, template=template)
         if left and right:
             return And(left, right)
         return left or right
-    if roll < 0.95:
-        left = _generate_condition(ctx, schema, depth + 1, stress_mode)
-        right = _generate_condition(ctx, schema, depth + 1, stress_mode)
+    if roll < 0.94:
+        left = _generate_condition(ctx, schema, depth + 1, stress_mode, template=template)
+        right = _generate_condition(ctx, schema, depth + 1, stress_mode, template=template)
         if left and right:
             return Or(left, right)
         return left or right
@@ -429,9 +762,18 @@ def _make_compare(
     left_join_right_numeric_cols: List[str],
     left_join_right_visible_cols: List[str],
     stress_mode: str,
+    force_null: bool = False,
 ) -> Optional[Compare]:
     if not numeric_cols and not nullable_visible_cols:
         return None
+
+    if force_null and nullable_visible_cols:
+        pool = nullable_visible_cols
+        if left_join_right_visible_cols:
+            pool = left_join_right_visible_cols
+        col = random.choice(pool)
+        op = random.choice([CmpOp.EQ, CmpOp.NEQ])
+        return Compare(col, op, None)
 
     null_compare_prob = 0.0
     if stress_mode == "null_heavy":
@@ -466,82 +808,118 @@ def _make_compare(
 
     col = random.choice(pool)
     op = random.choice([CmpOp.GT, CmpOp.GTE, CmpOp.LT, CmpOp.LTE, CmpOp.EQ])
-    val = random.randint(1, 100)
+    val = random.randint(0, 100)
     return Compare(col, op, val)
 
 
 def _generate_having_condition(
     ctx: GenContext,
     stress_mode: str = "balanced",
+    template: Optional[Dict[str, object]] = None,
 ) -> Optional[Condition]:
     if not ctx.agg_aliases:
         return None
+
+    if template and template.get("force_null_compare") and random.random() < 0.15:
+        alias_name = random.choice(ctx.agg_aliases)
+        return Compare(alias_name, random.choice([CmpOp.EQ, CmpOp.NEQ]), None)
+
     alias_name = random.choice(ctx.agg_aliases)
     if stress_mode in ("join_heavy", "null_heavy") and random.random() < 0.22:
         return Compare(alias_name, random.choice([CmpOp.EQ, CmpOp.NEQ]), None)
     op = random.choice([CmpOp.GT, CmpOp.GTE, CmpOp.LT, CmpOp.LTE])
-    val = random.randint(1, 200)
+    val = random.randint(0, 200)
     return Compare(alias_name, op, val)
 
 
-def _choose_project_fields(ctx: GenContext, stress_mode: str = "balanced") -> List[str]:
+def _choose_project_fields(
+    ctx: GenContext,
+    stress_mode: str = "balanced",
+    template: Optional[Dict[str, object]] = None,
+) -> List[str]:
     candidates = ctx.group_fields + ctx.agg_aliases if ctx.has_groupby else ctx.visible_cols
     if not candidates:
         return []
 
-    if not ctx.has_groupby:
-        right_fields = [
-            field
-            for field in candidates
-            if "." in field and field.split(".", 1)[0] in ctx.left_join_right_aliases
-        ]
-
-        duplicate_fields = _pick_duplicate_short_name_fields(candidates)
-        duplicate_prob = 0.45
-        if stress_mode == "duplicate_column_heavy":
-            duplicate_prob = 0.9
-        elif stress_mode == "join_heavy":
-            duplicate_prob = 0.6
-
-        if duplicate_fields and random.random() < duplicate_prob:
-            chosen = list(duplicate_fields)
-            remaining = [field for field in candidates if field not in chosen]
+    if ctx.has_groupby:
+        chosen = []
+        if ctx.group_fields:
+            chosen.append(random.choice(ctx.group_fields))
+        if ctx.agg_aliases:
+            chosen.append(random.choice(ctx.agg_aliases))
+            if stress_mode == "groupby_heavy" and len(ctx.agg_aliases) >= 2:
+                chosen.append(random.choice(ctx.agg_aliases))
+        chosen = _dedupe_keep_order(chosen)
+        remaining = [field for field in candidates if field not in chosen]
+        if remaining:
             extra_budget = min(2, len(remaining))
             extra_num = random.randint(0, extra_budget) if extra_budget > 0 else 0
             if extra_num > 0:
                 chosen.extend(random.sample(remaining, extra_num))
-            return chosen
+        return chosen if chosen else random.sample(candidates, random.randint(1, len(candidates)))
 
-        if (
-            stress_mode in ("join_heavy", "null_heavy")
-            and right_fields
-            and random.random() < 0.7
-        ):
-            pick_num = random.randint(1, len(right_fields))
-            chosen = random.sample(right_fields, pick_num)
-            remaining = [field for field in candidates if field not in chosen]
-            if remaining:
-                extra_budget = min(2, len(remaining))
-                extra_num = random.randint(0, extra_budget) if extra_budget > 0 else 0
-                if extra_num > 0:
-                    chosen.extend(random.sample(remaining, extra_num))
-            return chosen
+    right_fields = [
+        field
+        for field in candidates
+        if "." in field and field.split(".", 1)[0] in ctx.left_join_right_aliases
+    ]
+    duplicate_fields = _pick_duplicate_short_name_fields(candidates)
 
-        if stress_mode == "null_heavy":
-            nullable_fields = [f for f in _get_nullable_visible_cols(ctx) if f in candidates]
-            if nullable_fields and random.random() < 0.75:
-                nullable_num = random.randint(1, len(nullable_fields))
-                chosen = random.sample(nullable_fields, nullable_num)
-                remaining = [field for field in candidates if field not in chosen]
-                if remaining and len(chosen) < len(candidates):
-                    extra_budget = min(2, len(remaining))
-                    extra_num = random.randint(0, extra_budget) if extra_budget > 0 else 0
-                    if extra_num > 0:
-                        chosen.extend(random.sample(remaining, extra_num))
-                return chosen
+    if template and template.get("force_duplicate_projection") and duplicate_fields:
+        return _extend_projection(candidates, duplicate_fields, extra_limit=2)
+
+    if template and template.get("force_right_projection") and right_fields:
+        chosen = random.sample(right_fields, random.randint(1, len(right_fields)))
+        if duplicate_fields:
+            chosen = _dedupe_keep_order(duplicate_fields + chosen)
+        return _extend_projection(candidates, chosen, extra_limit=2)
+
+    duplicate_prob = 0.45
+    if stress_mode == "duplicate_column_heavy":
+        duplicate_prob = 0.9
+    elif stress_mode == "join_heavy":
+        duplicate_prob = 0.6
+
+    if duplicate_fields and random.random() < duplicate_prob:
+        return _extend_projection(candidates, duplicate_fields, extra_limit=2)
+
+    if stress_mode in ("join_heavy", "null_heavy") and right_fields and random.random() < 0.7:
+        chosen = random.sample(right_fields, random.randint(1, len(right_fields)))
+        return _extend_projection(candidates, chosen, extra_limit=2)
+
+    if stress_mode == "null_heavy":
+        nullable_fields = [f for f in _get_nullable_visible_cols(ctx) if f in candidates]
+        if nullable_fields and random.random() < 0.75:
+            chosen = random.sample(nullable_fields, random.randint(1, len(nullable_fields)))
+            return _extend_projection(candidates, chosen, extra_limit=2)
 
     pick_num = random.randint(1, len(candidates))
     return random.sample(candidates, pick_num)
+
+
+def _extend_projection(
+    candidates: List[str],
+    chosen: List[str],
+    extra_limit: int = 2,
+) -> List[str]:
+    chosen = _dedupe_keep_order(chosen)
+    remaining = [field for field in candidates if field not in chosen]
+    extra_budget = min(extra_limit, len(remaining))
+    extra_num = random.randint(0, extra_budget) if extra_budget > 0 else 0
+    if extra_num > 0:
+        chosen.extend(random.sample(remaining, extra_num))
+    return chosen
+
+
+def _dedupe_keep_order(items: List[str]) -> List[str]:
+    seen = set()
+    result = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
 
 
 def _pick_duplicate_short_name_fields(fields: List[str]) -> List[str]:
@@ -584,12 +962,17 @@ def _choose_group_fields(
     ctx: GenContext,
     stress_mode: str,
     fallback_fields: List[str],
+    template: Optional[Dict[str, object]] = None,
 ) -> List[str]:
     group_pool = _get_preferred_group_fields(ctx, stress_mode, fallback_fields)
     if not group_pool:
         group_pool = fallback_fields
     if not group_pool:
         return []
+
+    if template and template.get("require_groupby") and stress_mode == "groupby_heavy":
+        pick_num = min(2, len(group_pool))
+        return random.sample(group_pool, pick_num)
 
     pick_num = random.randint(1, min(2, len(group_pool)))
     return random.sample(group_pool, pick_num)
@@ -608,26 +991,62 @@ def _get_preferred_agg_cols(
     return numeric_cols if numeric_cols else fallback_fields
 
 
-def _choose_agg_func(stress_mode: str, agg_col: str, ctx: GenContext) -> AggFunc:
+def _choose_agg_func(
+    stress_mode: str,
+    agg_col: str,
+    ctx: GenContext,
+    template: Optional[Dict[str, object]] = None,
+) -> AggFunc:
     if (
         stress_mode in ("join_heavy", "null_heavy")
         and "." in agg_col
         and agg_col.split(".", 1)[0] in ctx.left_join_right_aliases
-        and random.random() < 0.8
+        and random.random() < 0.75
     ):
-        return random.choice([AggFunc.SUM, AggFunc.AVG, AggFunc.MAX, AggFunc.MIN])
+        return random.choice([AggFunc.SUM, AggFunc.AVG, AggFunc.MAX, AggFunc.MIN, AggFunc.COUNT])
+
+    if template and template.get("require_groupby") and random.random() < 0.35:
+        return random.choice([AggFunc.COUNT, AggFunc.AVG, AggFunc.MAX, AggFunc.MIN])
+
     return random.choice(list(AggFunc))
 
 
-def _choose_join_type(stress_mode: str, allow_left: bool = True) -> JoinType:
+def _choose_agg_field(
+    agg_func: AggFunc,
+    agg_col: str,
+    ctx: GenContext,
+    template: Optional[Dict[str, object]] = None,
+) -> str:
+    if agg_func != AggFunc.COUNT:
+        return agg_col
+
+    count_field_prob = 0.18
+    if template is not None:
+        count_field_prob = float(template.get("count_field_prob", count_field_prob))
+
+    nullable_cols = _get_nullable_visible_cols(ctx)
+    if template and template.get("prefer_nullable_agg_field") and nullable_cols and random.random() < 0.7:
+        return random.choice(nullable_cols)
+    if random.random() < count_field_prob:
+        return agg_col
+    return "*"
+
+
+def _choose_join_type(
+    stress_mode: str,
+    allow_left: bool = True,
+    force_left: bool = False,
+) -> JoinType:
     if not allow_left:
         return JoinType.INNER
+    if force_left:
+        return JoinType.LEFT
 
     left_prob = 0.1
     if stress_mode == "join_heavy":
         left_prob = 0.35
     elif stress_mode == "null_heavy":
-        left_prob = 0.55
+        left_prob = 0.6
     elif stress_mode == "groupby_heavy":
         left_prob = 0.2
     return JoinType.LEFT if random.random() < left_prob else JoinType.INNER
@@ -642,33 +1061,37 @@ def _apply_stress_mode(
 ) -> Tuple[float, float, float, float]:
     if stress_mode == "join_heavy":
         return (
-            min(1.0, join_prob + 0.25),
-            min(1.0, filter_prob + 0.1),
-            min(1.0, groupby_prob + 0.1),
+            min(1.0, join_prob + 0.28),
+            min(1.0, filter_prob + 0.14),
+            min(1.0, groupby_prob + 0.12),
             min(1.0, having_prob + 0.1),
         )
     if stress_mode == "duplicate_column_heavy":
         return (
-            min(1.0, join_prob + 0.2),
+            min(1.0, join_prob + 0.22),
             filter_prob,
-            min(1.0, groupby_prob + 0.05),
+            min(1.0, groupby_prob + 0.08),
             having_prob,
         )
     if stress_mode == "null_heavy":
         return (
-            min(1.0, join_prob + 0.05),
-            min(1.0, filter_prob + 0.1),
-            min(1.0, groupby_prob + 0.15),
+            min(1.0, join_prob + 0.1),
+            min(1.0, filter_prob + 0.14),
+            min(1.0, groupby_prob + 0.18),
             min(1.0, having_prob + 0.1),
         )
     if stress_mode == "groupby_heavy":
         return (
-            join_prob,
-            filter_prob,
-            min(1.0, groupby_prob + 0.3),
-            min(1.0, having_prob + 0.2),
+            min(1.0, join_prob + 0.05),
+            min(1.0, filter_prob + 0.08),
+            min(1.0, groupby_prob + 0.35),
+            min(1.0, having_prob + 0.28),
         )
     return join_prob, filter_prob, groupby_prob, having_prob
+
+
+def _short_field_name(field_name: str) -> str:
+    return field_name.split(".", 1)[1] if "." in field_name else field_name
 
 
 if __name__ == "__main__":
@@ -678,9 +1101,9 @@ if __name__ == "__main__":
     schema = generate_schema(num_tables=4, cols_per_table=3, fk_prob=0.8, seed=42)
     print_schema(schema)
     print()
-    for i in range(3):
-        ir, ctx = generate_ir(schema, stress_mode="join_heavy", seed=i)
-        print(f"--- IR #{i + 1} ---")
+    for mode in ("balanced", "join_heavy", "groupby_heavy", "duplicate_column_heavy", "null_heavy"):
+        ir, ctx = generate_ir(schema, stress_mode=mode, seed=7)
+        print(f"--- mode={mode} ---")
         print(pretty_print(ir))
         print(f"visible_cols={ctx.visible_cols}")
         print(f"left_join_right_aliases={sorted(ctx.left_join_right_aliases)}")

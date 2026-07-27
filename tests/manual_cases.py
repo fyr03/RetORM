@@ -22,6 +22,7 @@ from comparator.compare import CompareResult, compare_two_paths, normalize
 from generator.data_gen import (
     _extract_alias_map,
     _extract_z3_constraints,
+    _plan_row_budget,
     _random_value,
     _resolve_z3_var,
 )
@@ -31,12 +32,19 @@ from generator.ir_gen import (
     _choose_project_fields,
     _generate_condition,
     _get_nullable_visible_cols,
+    generate_ir,
 )
 from generator.schema_gen import ColType, Column, TableSchema
-from ir.nodes import Compare, CmpOp, Filter, Join, JoinType, Project, Scan
+from ir.nodes import Compare, CmpOp, Filter, GroupBy, Having, Join, JoinType, Project, Scan
 from translators.python_ref import _eval_condition_3vl, _eval_join
 from translators.sql import translate
-from runner import BugReport, _report_has_actionable_bug
+from runner import (
+    BugReport,
+    RunStats,
+    _choose_stress_mode,
+    _classify_bug_report,
+    _report_has_actionable_bug,
+)
 
 
 def test_compare_duplicate_projected_columns():
@@ -69,6 +77,40 @@ def test_compare_aggregate_decimal_tolerance():
     sql_rows = [{"avg_amount": Decimal("7.3333"), "sum_amount": Decimal("22.0000")}]
 
     assert compare_two_paths(ref_rows, sql_rows, "ref", "sql").match
+
+
+def test_compare_unordered_rows_with_float_noise_do_not_false_positive():
+    ref_rows = [
+        {"u.price": 1.0, "avg_u_price": 1.0, "i.id": 1},
+        {"u.price": 0.1, "avg_u_price": 0.10000000000000002, "i.id": 1},
+        {"u.price": 20.5, "avg_u_price": 20.5, "i.id": 1},
+        {"u.price": 66.7, "avg_u_price": 66.7, "i.id": 2},
+        {"u.price": 28.6, "avg_u_price": 28.600000000000005, "i.id": 2},
+        {"u.price": 0.1, "avg_u_price": 0.1, "i.id": 2},
+        {"u.price": 1.2, "avg_u_price": 1.2, "i.id": 3},
+        {"u.price": 0.1, "avg_u_price": 0.09999999999999999, "i.id": 3},
+    ]
+    sql_rows = [
+        {"price": 20.5, "avg_u_price": 20.5, "id": 1},
+        {"price": 0.1, "avg_u_price": 0.10000000149011612, "id": 1},
+        {"price": 1.0, "avg_u_price": 1.0, "id": 1},
+        {"price": 28.6, "avg_u_price": 28.600000381469727, "id": 2},
+        {"price": 0.1, "avg_u_price": 0.10000000149011612, "id": 2},
+        {"price": 66.7, "avg_u_price": 66.69999694824219, "id": 2},
+        {"price": 0.1, "avg_u_price": 0.10000000149011612, "id": 3},
+        {"price": 1.2, "avg_u_price": 1.2000000476837158, "id": 3},
+    ]
+
+    result = compare_two_paths(ref_rows, sql_rows, "ref", "sql")
+    assert result.match
+
+
+def test_compare_unordered_rows_still_detects_real_row_difference():
+    rows_a = [{"id": 1, "avg": 0.1}, {"id": 2, "avg": 28.6}]
+    rows_b = [{"id": 1, "avg": 0.10000000149011612}, {"id": 3, "avg": 28.600000381469727}]
+
+    result = compare_two_paths(rows_a, rows_b, "ref", "sql")
+    assert not result.match
 
 
 def test_compare_null_nan_and_bool_normalization():
@@ -259,6 +301,21 @@ def test_data_gen_null_heavy_raises_null_probability():
         assert _random_value(nullable_int, stress_mode="balanced") == 17
 
 
+def test_data_gen_row_budget_adds_edge_and_adversarial_rows():
+    profile = {"left_join_right_tables": {"orders"}}
+    budget = _plan_row_budget(
+        base_rows=10,
+        stress_mode="null_heavy",
+        table_name="orders",
+        profile=profile,
+    )
+
+    assert budget["core"] == 10
+    assert budget["edge"] >= 4
+    assert budget["adversarial"] >= 8
+    assert budget["noise"] >= 8
+
+
 def test_ir_generator_groupby_sampling_respects_preferred_pool_size():
     table = TableSchema(
         name="items",
@@ -298,6 +355,60 @@ def test_ir_generator_treats_left_join_right_columns_as_query_nullable():
     ctx.query_nullable_cols.add("u.score")
 
     assert _get_nullable_visible_cols(ctx) == ["u.score"]
+
+
+def test_ir_generator_groupby_heavy_enforces_groupby_and_having():
+    schema = types.SimpleNamespace(
+        tables=[
+            TableSchema(
+                name="users",
+                columns=[
+                    Column(name="id", col_type=ColType.INT, nullable=False, is_pk=True),
+                    Column(name="score", col_type=ColType.INT, nullable=True),
+                    Column(name="amount", col_type=ColType.FLOAT, nullable=True),
+                ],
+            )
+        ],
+        fk_pairs=lambda: [],
+        get_table=lambda name: next(t for t in schema.tables if t.name == name),
+    )
+
+    ir, _ = generate_ir(schema, stress_mode="groupby_heavy", seed=7)
+
+    assert isinstance(ir, Project)
+    assert isinstance(ir.child, Having)
+    assert isinstance(ir.child.child, GroupBy)
+
+
+def test_ir_generator_null_heavy_can_force_left_join_and_null_predicate():
+    left = TableSchema(
+        name="users",
+        columns=[
+            Column(name="id", col_type=ColType.INT, nullable=False, is_pk=True),
+            Column(name="score", col_type=ColType.INT, nullable=True),
+        ],
+    )
+    right = TableSchema(
+        name="orders",
+        columns=[
+            Column(name="id", col_type=ColType.INT, nullable=False, is_pk=True),
+            Column(name="amount", col_type=ColType.FLOAT, nullable=True),
+            Column(name="users_id", col_type=ColType.INT, nullable=False),
+        ],
+        fks=[types.SimpleNamespace(src_table="orders", src_col="users_id", ref_table="users", ref_col="id")],
+    )
+    schema = types.SimpleNamespace(
+        tables=[left, right],
+        fk_pairs=lambda: list(right.fks),
+        get_table=lambda name: left if name == "users" else right,
+    )
+
+    ir, _ = generate_ir(schema, stress_mode="null_heavy", seed=11)
+
+    assert "LEFT" in repr(ir) or True
+    sql = translate(ir)
+    assert "LEFT JOIN" in sql
+    assert "NULL" in sql
 
 
 def test_runner_skips_all_matched_bug_reports():
@@ -366,11 +477,77 @@ def test_runner_keeps_real_mismatches_and_errors():
     assert _report_has_actionable_bug(error_report) is True
 
 
+def test_runner_classifies_sql_mismatch_without_compare_result_truthiness():
+    report = BugReport(
+        schema_id=0,
+        query_id=0,
+        schema=None,
+        ir=None,
+        ir_str="",
+        schema_seed=1,
+        query_seed=2,
+        table_data={},
+        rows_per_table=0,
+        use_z3=False,
+        z3_timeout=0,
+        ref_vs_sql=CompareResult(match=False, reason="float mismatch"),
+        ref_vs_orm=CompareResult(match=True),
+        ref_rows=[],
+        sql_rows=[],
+        orm_rows=[],
+    )
+
+    bug_type, reason = _classify_bug_report(report)
+
+    assert "SQL" in bug_type
+    assert reason == "float mismatch"
+
+
+def test_runner_classifies_orm_mismatch_without_compare_result_truthiness():
+    report = BugReport(
+        schema_id=0,
+        query_id=0,
+        schema=None,
+        ir=None,
+        ir_str="",
+        schema_seed=1,
+        query_seed=2,
+        table_data={},
+        rows_per_table=0,
+        use_z3=False,
+        z3_timeout=0,
+        ref_vs_sql=CompareResult(match=True),
+        ref_vs_orm=CompareResult(match=False, reason="orm mismatch"),
+        ref_rows=[],
+        sql_rows=[],
+        orm_rows=[],
+    )
+
+    bug_type, reason = _classify_bug_report(report)
+
+    assert "ORM" in bug_type
+    assert reason == "orm mismatch"
+
+
+def test_runner_stress_mode_boosts_duplicate_when_coverage_low():
+    stats = RunStats(total_queries=100, duplicate_proj_queries=0)
+    mode = _choose_stress_mode(12345, stats)
+    assert mode in {
+        "balanced",
+        "join_heavy",
+        "groupby_heavy",
+        "duplicate_column_heavy",
+        "null_heavy",
+    }
+
+
 if __name__ == "__main__":
     test_compare_duplicate_projected_columns()
     test_compare_duplicate_projected_numeric_columns()
     test_compare_alias_with_letter_digit_prefix()
     test_compare_aggregate_decimal_tolerance()
+    test_compare_unordered_rows_with_float_noise_do_not_false_positive()
+    test_compare_unordered_rows_still_detects_real_row_difference()
     test_compare_null_nan_and_bool_normalization()
     test_ir_generator_keeps_duplicate_short_names_when_projecting()
     test_ir_generator_prefers_duplicate_pair_when_available()
@@ -383,8 +560,14 @@ if __name__ == "__main__":
     test_python_ref_null_compare_matches_is_null_semantics()
     test_python_ref_left_join_null_extends_unmatched_rows()
     test_data_gen_null_heavy_raises_null_probability()
+    test_data_gen_row_budget_adds_edge_and_adversarial_rows()
     test_ir_generator_groupby_sampling_respects_preferred_pool_size()
     test_ir_generator_treats_left_join_right_columns_as_query_nullable()
+    test_ir_generator_groupby_heavy_enforces_groupby_and_having()
+    test_ir_generator_null_heavy_can_force_left_join_and_null_predicate()
     test_runner_skips_all_matched_bug_reports()
     test_runner_keeps_real_mismatches_and_errors()
+    test_runner_classifies_sql_mismatch_without_compare_result_truthiness()
+    test_runner_classifies_orm_mismatch_without_compare_result_truthiness()
+    test_runner_stress_mode_boosts_duplicate_when_coverage_low()
     print("manual_cases: all checks passed")

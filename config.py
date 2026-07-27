@@ -24,3 +24,7 @@ NUM_SCHEMAS     = 5      # 每轮生成多少个 schema
 QUERIES_PER_SCHEMA = 20  # 每个 schema 生成多少条 IR
 Z3_TIMEOUT_SEC  = 5      # Z3 求解器超时时间（秒）
 RANDOM_ROWS     = 10     # 随机数据生成时每张表插多少行
+EXTRA_RANDOM_ROWS = 6    # 在基础行数上额外追加的噪声随机行
+EDGE_ROWS        = 4     # 每张表追加的固定边缘行数量
+ADVERSARIAL_ROWS = 4     # 每张表追加的对抗性数据行数量
+STRESS_RETRY_BUDGET = 12 # 高压模式下为了满足结构约束的重试次数
