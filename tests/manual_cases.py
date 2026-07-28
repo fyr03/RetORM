@@ -35,16 +35,39 @@ from generator.ir_gen import (
     generate_ir,
 )
 from generator.schema_gen import ColType, Column, TableSchema
-from ir.nodes import Compare, CmpOp, Filter, GroupBy, Having, Join, JoinType, Project, Scan
-from translators.python_ref import _eval_condition_3vl, _eval_join
+from ir.nodes import (
+    AggFunc,
+    Aggregate,
+    Compare,
+    CmpOp,
+    Distinct,
+    Filter,
+    GroupBy,
+    Having,
+    Join,
+    JoinType,
+    OrderBy,
+    OrderKey,
+    Project,
+    Scan,
+)
+from translators.python_ref import _eval_condition_3vl, _eval_distinct, _eval_join, _eval_orderby
 from translators.sql import translate
 from runner import (
     BugReport,
     RunStats,
+    _collect_query_features,
     _choose_stress_mode,
     _classify_bug_report,
+    _query_requires_ordered_compare,
     _report_has_actionable_bug,
 )
+
+
+def _unwrap_wrappers(node):
+    while isinstance(node, (Distinct, OrderBy)):
+        node = node.child
+    return node
 
 
 def test_compare_duplicate_projected_columns():
@@ -110,6 +133,14 @@ def test_compare_unordered_rows_still_detects_real_row_difference():
     rows_b = [{"id": 1, "avg": 0.10000000149011612}, {"id": 3, "avg": 28.600000381469727}]
 
     result = compare_two_paths(rows_a, rows_b, "ref", "sql")
+    assert not result.match
+
+
+def test_compare_ordered_rows_detects_sequence_difference():
+    rows_a = [{"id": 1, "amount": 10}, {"id": 2, "amount": 20}]
+    rows_b = [{"id": 2, "amount": 20}, {"id": 1, "amount": 10}]
+
+    result = compare_two_paths(rows_a, rows_b, "ref", "sql", ordered=True)
     assert not result.match
 
 
@@ -250,6 +281,27 @@ def test_sql_translate_supports_nested_join_chain():
     assert "INNER JOIN" in sql
 
 
+def test_sql_translate_supports_distinct_and_orderby():
+    ir = OrderBy(
+        keys=[OrderKey("sum_o_amount", descending=True), OrderKey("o.id")],
+        child=Distinct(
+            child=Project(
+                fields=["o.id", "sum_o_amount"],
+                child=GroupBy(
+                    fields=["o.id"],
+                    aggregates=[Aggregate(AggFunc.SUM, "o.amount", "sum_o_amount")],
+                    child=Scan("orders", "o"),
+                ),
+            )
+        ),
+    )
+
+    sql = translate(ir)
+    assert "SELECT DISTINCT" in sql
+    assert "ORDER BY" in sql
+    assert "DESC" in sql
+
+
 def test_python_ref_null_compare_matches_is_null_semantics():
     row = {"u.score": None, "u.id": 1}
     not_null_row = {"u.score": 7, "u.id": 2}
@@ -286,6 +338,42 @@ def test_python_ref_left_join_null_extends_unmatched_rows():
     assert rows == [
         {"o.id": 1, "o.user_id": 1, "u.id": 1, "u.score": 7},
         {"o.id": 2, "o.user_id": 99, "u.id": None, "u.score": None},
+    ]
+
+
+def test_python_ref_distinct_removes_duplicate_rows():
+    node = Distinct(child=Scan("orders", "o"))
+
+    with patch("translators.python_ref._eval", return_value=[
+        {"o.id": 1, "o.amount": 10},
+        {"o.id": 1, "o.amount": 10},
+        {"o.id": 2, "o.amount": 10},
+    ]):
+        rows = _eval_distinct(node)
+
+    assert rows == [
+        {"o.id": 1, "o.amount": 10},
+        {"o.id": 2, "o.amount": 10},
+    ]
+
+
+def test_python_ref_orderby_applies_mixed_direction_keys():
+    node = OrderBy(
+        keys=[OrderKey("o.amount", descending=True), OrderKey("o.id", descending=False)],
+        child=Scan("orders", "o"),
+    )
+
+    with patch("translators.python_ref._eval", return_value=[
+        {"o.id": 2, "o.amount": 10},
+        {"o.id": 1, "o.amount": 10},
+        {"o.id": 3, "o.amount": 20},
+    ]):
+        rows = _eval_orderby(node)
+
+    assert rows == [
+        {"o.id": 3, "o.amount": 20},
+        {"o.id": 1, "o.amount": 10},
+        {"o.id": 2, "o.amount": 10},
     ]
 
 
@@ -375,9 +463,61 @@ def test_ir_generator_groupby_heavy_enforces_groupby_and_having():
 
     ir, _ = generate_ir(schema, stress_mode="groupby_heavy", seed=7)
 
-    assert isinstance(ir, Project)
-    assert isinstance(ir.child, Having)
-    assert isinstance(ir.child.child, GroupBy)
+    assert isinstance(ir, OrderBy)
+    core = _unwrap_wrappers(ir)
+    assert isinstance(core, Project)
+    assert isinstance(core.child, Having)
+    assert isinstance(core.child.child, GroupBy)
+
+
+def test_ir_generator_orderby_heavy_emits_orderby():
+    schema = types.SimpleNamespace(
+        tables=[
+            TableSchema(
+                name="users",
+                columns=[
+                    Column(name="id", col_type=ColType.INT, nullable=False, is_pk=True),
+                    Column(name="score", col_type=ColType.INT, nullable=True),
+                ],
+            ),
+            TableSchema(
+                name="orders",
+                columns=[
+                    Column(name="id", col_type=ColType.INT, nullable=False, is_pk=True),
+                    Column(name="amount", col_type=ColType.FLOAT, nullable=True),
+                    Column(name="users_id", col_type=ColType.INT, nullable=False),
+                ],
+                fks=[types.SimpleNamespace(src_table="orders", src_col="users_id", ref_table="users", ref_col="id")],
+            ),
+        ],
+        fk_pairs=lambda: list(schema.tables[1].fks),
+        get_table=lambda name: schema.tables[0] if name == "users" else schema.tables[1],
+    )
+
+    ir, _ = generate_ir(schema, stress_mode="orderby_heavy", seed=7)
+
+    assert _query_requires_ordered_compare(ir) is True
+    assert _collect_query_features(ir)["has_orderby"] is True
+
+
+def test_ir_generator_distinct_heavy_emits_distinct():
+    schema = types.SimpleNamespace(
+        tables=[
+            TableSchema(
+                name="users",
+                columns=[
+                    Column(name="id", col_type=ColType.INT, nullable=False, is_pk=True),
+                    Column(name="score", col_type=ColType.INT, nullable=True),
+                ],
+            )
+        ],
+        fk_pairs=lambda: [],
+        get_table=lambda name: schema.tables[0],
+    )
+
+    ir, _ = generate_ir(schema, stress_mode="distinct_heavy", seed=9)
+
+    assert _collect_query_features(ir)["has_distinct"] is True
 
 
 def test_ir_generator_null_heavy_can_force_left_join_and_null_predicate():
@@ -409,6 +549,27 @@ def test_ir_generator_null_heavy_can_force_left_join_and_null_predicate():
     sql = translate(ir)
     assert "LEFT JOIN" in sql
     assert "NULL" in sql
+
+
+def test_runner_collects_distinct_and_orderby_features():
+    ir = OrderBy(
+        keys=[OrderKey("sum_o_amount")],
+        child=Distinct(
+            child=Project(
+                fields=["o.id", "sum_o_amount"],
+                child=GroupBy(
+                    fields=["o.id"],
+                    aggregates=[Aggregate(AggFunc.SUM, "o.amount", "sum_o_amount")],
+                    child=Scan("orders", "o"),
+                ),
+            )
+        ),
+    )
+
+    features = _collect_query_features(ir)
+    assert features["has_distinct"] is True
+    assert features["has_orderby"] is True
+    assert features["has_orderby_agg"] is True
 
 
 def test_runner_skips_all_matched_bug_reports():
@@ -529,6 +690,33 @@ def test_runner_classifies_orm_mismatch_without_compare_result_truthiness():
     assert reason == "orm mismatch"
 
 
+def test_runner_classifies_ref_anomaly_when_sql_equals_orm():
+    report = BugReport(
+        schema_id=0,
+        query_id=0,
+        schema=None,
+        ir=None,
+        ir_str="",
+        schema_seed=1,
+        query_seed=2,
+        table_data={},
+        rows_per_table=0,
+        use_z3=False,
+        z3_timeout=0,
+        ref_vs_sql=CompareResult(match=False, reason="ref mismatch"),
+        ref_vs_orm=CompareResult(match=False, reason="ref mismatch"),
+        sql_vs_orm=CompareResult(match=True),
+        ref_rows=[],
+        sql_rows=[],
+        orm_rows=[],
+    )
+
+    bug_type, reason = _classify_bug_report(report)
+
+    assert "Ref" in bug_type
+    assert "sql_vs_orm" in reason
+
+
 def test_runner_stress_mode_boosts_duplicate_when_coverage_low():
     stats = RunStats(total_queries=100, duplicate_proj_queries=0)
     mode = _choose_stress_mode(12345, stats)
@@ -538,6 +726,8 @@ def test_runner_stress_mode_boosts_duplicate_when_coverage_low():
         "groupby_heavy",
         "duplicate_column_heavy",
         "null_heavy",
+        "orderby_heavy",
+        "distinct_heavy",
     }
 
 
@@ -548,6 +738,7 @@ if __name__ == "__main__":
     test_compare_aggregate_decimal_tolerance()
     test_compare_unordered_rows_with_float_noise_do_not_false_positive()
     test_compare_unordered_rows_still_detects_real_row_difference()
+    test_compare_ordered_rows_detects_sequence_difference()
     test_compare_null_nan_and_bool_normalization()
     test_ir_generator_keeps_duplicate_short_names_when_projecting()
     test_ir_generator_prefers_duplicate_pair_when_available()
@@ -557,17 +748,24 @@ if __name__ == "__main__":
     test_sql_translate_uses_is_null_and_is_not_null()
     test_sql_translate_supports_left_join()
     test_sql_translate_supports_nested_join_chain()
+    test_sql_translate_supports_distinct_and_orderby()
     test_python_ref_null_compare_matches_is_null_semantics()
     test_python_ref_left_join_null_extends_unmatched_rows()
+    test_python_ref_distinct_removes_duplicate_rows()
+    test_python_ref_orderby_applies_mixed_direction_keys()
     test_data_gen_null_heavy_raises_null_probability()
     test_data_gen_row_budget_adds_edge_and_adversarial_rows()
     test_ir_generator_groupby_sampling_respects_preferred_pool_size()
     test_ir_generator_treats_left_join_right_columns_as_query_nullable()
     test_ir_generator_groupby_heavy_enforces_groupby_and_having()
+    test_ir_generator_orderby_heavy_emits_orderby()
+    test_ir_generator_distinct_heavy_emits_distinct()
     test_ir_generator_null_heavy_can_force_left_join_and_null_predicate()
+    test_runner_collects_distinct_and_orderby_features()
     test_runner_skips_all_matched_bug_reports()
     test_runner_keeps_real_mismatches_and_errors()
     test_runner_classifies_sql_mismatch_without_compare_result_truthiness()
     test_runner_classifies_orm_mismatch_without_compare_result_truthiness()
+    test_runner_classifies_ref_anomaly_when_sql_equals_orm()
     test_runner_stress_mode_boosts_duplicate_when_coverage_low()
     print("manual_cases: all checks passed")

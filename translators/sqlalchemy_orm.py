@@ -21,6 +21,7 @@ from ir.nodes import (
     CmpOp,
     Compare,
     Condition,
+    Distinct,
     Filter,
     GroupBy,
     Having,
@@ -28,6 +29,8 @@ from ir.nodes import (
     JoinType,
     Not,
     Or,
+    OrderBy,
+    OrderKey,
     Project,
     QueryNode,
     Scan,
@@ -94,20 +97,34 @@ def _collect_ctx(node: QueryNode, engine: Engine) -> dict:
         return _build_having_ctx(node, engine)
     if isinstance(node, Project):
         return _build_project_ctx(node, engine)
+    if isinstance(node, Distinct):
+        return _build_distinct_ctx(node, engine)
+    if isinstance(node, OrderBy):
+        return _build_orderby_ctx(node, engine)
     raise NotImplementedError(f"unknown node type: {type(node)}")
 
 
-def _build_scan_ctx(node: Scan, engine: Engine) -> dict:
-    table_alias = _get_table(node.table, engine).alias(node.alias)
+def _base_ctx() -> dict:
     return {
-        "froms": [table_alias],
-        "tables": {node.alias: table_alias},
+        "froms": [],
+        "tables": {},
         "where": [],
         "groupby": [],
         "having": [],
         "agg_map": {},
-        "select_cols": [table_alias],
+        "select_cols": [],
+        "distinct": False,
+        "orderby": [],
     }
+
+
+def _build_scan_ctx(node: Scan, engine: Engine) -> dict:
+    table_alias = _get_table(node.table, engine).alias(node.alias)
+    ctx = _base_ctx()
+    ctx["froms"] = [table_alias]
+    ctx["tables"] = {node.alias: table_alias}
+    ctx["select_cols"] = [table_alias]
+    return ctx
 
 
 def _build_filter_ctx(node: Filter, engine: Engine) -> dict:
@@ -120,15 +137,15 @@ def _build_join_ctx(node: Join, engine: Engine) -> dict:
     left_ctx = _collect_ctx(node.left, engine)
     right_ctx = _collect_ctx(node.right, engine)
 
-    ctx = {
-        "froms": [],
-        "tables": {**left_ctx["tables"], **right_ctx["tables"]},
-        "where": left_ctx["where"] + right_ctx["where"],
-        "groupby": left_ctx["groupby"] + right_ctx["groupby"],
-        "having": left_ctx["having"] + right_ctx["having"],
-        "agg_map": {**left_ctx["agg_map"], **right_ctx["agg_map"]},
-        "select_cols": list(left_ctx["select_cols"]) + list(right_ctx["select_cols"]),
-    }
+    ctx = _base_ctx()
+    ctx["tables"] = {**left_ctx["tables"], **right_ctx["tables"]}
+    ctx["where"] = left_ctx["where"] + right_ctx["where"]
+    ctx["groupby"] = left_ctx["groupby"] + right_ctx["groupby"]
+    ctx["having"] = left_ctx["having"] + right_ctx["having"]
+    ctx["agg_map"] = {**left_ctx["agg_map"], **right_ctx["agg_map"]}
+    ctx["select_cols"] = list(left_ctx["select_cols"]) + list(right_ctx["select_cols"])
+    ctx["distinct"] = left_ctx["distinct"] or right_ctx["distinct"]
+    ctx["orderby"] = left_ctx["orderby"] + right_ctx["orderby"]
 
     left_from = left_ctx["froms"][0]
     right_from = right_ctx["froms"][0]
@@ -171,9 +188,20 @@ def _build_project_ctx(node: Project, engine: Engine) -> dict:
             cols.append(ctx["agg_map"][field])
         else:
             col = _resolve_col(field, ctx)
-            label_name = field.replace(".", "_")
-            cols.append(col.label(label_name))
+            cols.append(col.label(field.replace(".", "_")))
     ctx["select_cols"] = cols
+    return ctx
+
+
+def _build_distinct_ctx(node: Distinct, engine: Engine) -> dict:
+    ctx = _collect_ctx(node.child, engine)
+    ctx["distinct"] = True
+    return ctx
+
+
+def _build_orderby_ctx(node: OrderBy, engine: Engine) -> dict:
+    ctx = _collect_ctx(node.child, engine)
+    ctx["orderby"] = [_build_order_key(key, ctx) for key in node.keys]
     return ctx
 
 
@@ -186,6 +214,8 @@ def _assemble(ctx: dict):
             expanded.append(item)
 
     stmt = select(*expanded)
+    if ctx["distinct"]:
+        stmt = stmt.distinct()
     for from_clause in ctx["froms"]:
         stmt = stmt.select_from(from_clause)
     if ctx["where"]:
@@ -194,13 +224,19 @@ def _assemble(ctx: dict):
         stmt = stmt.group_by(*ctx["groupby"])
     if ctx["having"]:
         stmt = stmt.having(and_(*ctx["having"]))
+    if ctx["orderby"]:
+        stmt = stmt.order_by(*ctx["orderby"])
     return stmt
 
 
 def _build_condition(cond: Condition, ctx: dict):
     if isinstance(cond, Compare):
         left_col = _resolve_col(cond.field, ctx)
-        right = _resolve_col(cond.value, ctx) if isinstance(cond.value, str) and "." in cond.value else cond.value
+        right = (
+            _resolve_col(cond.value, ctx)
+            if isinstance(cond.value, str) and "." in cond.value
+            else cond.value
+        )
 
         if right is None:
             if cond.op == CmpOp.EQ:
@@ -245,6 +281,11 @@ def _build_aggregate(agg: Aggregate, ctx: dict):
     return fn_map[agg.func](col)
 
 
+def _build_order_key(key: OrderKey, ctx: dict):
+    expr = _resolve_col(key.field, ctx)
+    return expr.desc() if key.descending else expr.asc()
+
+
 def _resolve_col(field_name: str, ctx: dict):
     if field_name in ctx.get("agg_map", {}):
         return ctx["agg_map"][field_name]
@@ -274,5 +315,5 @@ def _resolve_col(field_name: str, ctx: dict):
         return matches[0]
     raise KeyError(
         f"[sqlalchemy_orm] field '{field_name}' not found, "
-        f"known aliases: {list(ctx['tables'].keys())}"
+        f"known aliases: {list(ctx['tables'].keys()) + list(ctx.get('agg_map', {}).keys())}"
     )

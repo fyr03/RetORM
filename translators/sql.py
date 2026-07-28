@@ -1,7 +1,7 @@
 """
 translators/sql.py
 
-Path 2: IR -> Raw SQL.
+Path 2: IR -> raw SQL.
 """
 
 import os
@@ -17,6 +17,7 @@ from ir.nodes import (
     CmpOp,
     Compare,
     Condition,
+    Distinct,
     Filter,
     GroupBy,
     Having,
@@ -24,10 +25,22 @@ from ir.nodes import (
     JoinType,
     Not,
     Or,
+    OrderBy,
+    OrderKey,
     Project,
     QueryNode,
     Scan,
 )
+
+
+TranslateState = Tuple[
+    str,
+    str,
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[str],
+]
 
 
 def execute(ir: QueryNode) -> List[dict]:
@@ -37,7 +50,7 @@ def execute(ir: QueryNode) -> List[dict]:
 
 
 def translate(ir: QueryNode) -> str:
-    select_clause, from_clause, where_clause, groupby_clause, having_clause = _translate(ir)
+    select_clause, from_clause, where_clause, groupby_clause, having_clause, orderby_clause = _translate(ir)
 
     parts = [select_clause, from_clause]
     if where_clause:
@@ -46,12 +59,12 @@ def translate(ir: QueryNode) -> str:
         parts.append(f"GROUP BY {groupby_clause}")
     if having_clause:
         parts.append(f"HAVING {having_clause}")
+    if orderby_clause:
+        parts.append(f"ORDER BY {orderby_clause}")
     return "\n".join(parts) + ";"
 
 
-def _translate(
-    node: QueryNode,
-) -> Tuple[str, str, Optional[str], Optional[str], Optional[str]]:
+def _translate(node: QueryNode) -> TranslateState:
     if isinstance(node, Scan):
         return _translate_scan(node)
     if isinstance(node, Filter):
@@ -64,15 +77,19 @@ def _translate(
         return _translate_having(node)
     if isinstance(node, Project):
         return _translate_project(node)
+    if isinstance(node, Distinct):
+        return _translate_distinct(node)
+    if isinstance(node, OrderBy):
+        return _translate_orderby(node)
     raise NotImplementedError(f"unknown node type: {type(node)}")
 
 
-def _translate_scan(node: Scan):
-    return "SELECT *", f"FROM `{node.table}` AS `{node.alias}`", None, None, None
+def _translate_scan(node: Scan) -> TranslateState:
+    return "SELECT *", f"FROM `{node.table}` AS `{node.alias}`", None, None, None, None
 
 
-def _translate_filter(node: Filter):
-    select, from_, where, groupby, having = _translate(node.child)
+def _translate_filter(node: Filter) -> TranslateState:
+    select, from_, where, groupby, having, orderby = _translate(node.child)
     new_where = _translate_condition(node.condition)
     return (
         select,
@@ -80,14 +97,18 @@ def _translate_filter(node: Filter):
         f"({where}) AND ({new_where})" if where else new_where,
         groupby,
         having,
+        orderby,
     )
 
 
-def _translate_join(node: Join):
+def _translate_join(node: Join) -> TranslateState:
     on = _translate_condition(node.on)
     join_keyword = "LEFT JOIN" if node.join_type == JoinType.LEFT else "INNER JOIN"
-    from_ = f"FROM {_render_from_expr(node.left)}\n{join_keyword} {_render_from_expr(node.right)} ON {on}"
-    return "SELECT *", from_, None, None, None
+    from_ = (
+        f"FROM {_render_from_expr(node.left)}\n"
+        f"{join_keyword} {_render_from_expr(node.right)} ON {on}"
+    )
+    return "SELECT *", from_, None, None, None, None
 
 
 def _render_from_expr(node: QueryNode) -> str:
@@ -103,12 +124,51 @@ def _render_from_expr(node: QueryNode) -> str:
     raise NotImplementedError(f"unsupported FROM node: {type(node)}")
 
 
-def _translate_groupby(node: GroupBy):
-    select, from_, where, _, having = _translate(node.child)
+def _translate_groupby(node: GroupBy) -> TranslateState:
+    _, from_, where, _, having, orderby = _translate(node.child)
     group_cols = ", ".join(_quote_field(field) for field in node.fields)
     agg_exprs = [_translate_aggregate(agg) for agg in node.aggregates]
     select_cols = ", ".join([_quote_field(field) for field in node.fields] + agg_exprs)
-    return f"SELECT {select_cols}", from_, where, group_cols, having
+    return f"SELECT {select_cols}", from_, where, group_cols, having, orderby
+
+
+def _translate_having(node: Having) -> TranslateState:
+    select, from_, where, groupby, _, orderby = _translate(node.child)
+    agg_expr_map = _collect_agg_exprs(node.child)
+    having = _translate_condition(node.condition, agg_expr_map=agg_expr_map)
+    return select, from_, where, groupby, having, orderby
+
+
+def _translate_project(node: Project) -> TranslateState:
+    _, from_, where, groupby, having, orderby = _translate(node.child)
+    agg_map = _collect_aggregates(node.child)
+    col_exprs = []
+    for field in node.fields:
+        col_exprs.append(agg_map[field] if field in agg_map else _quote_field(field))
+    return f"SELECT {', '.join(col_exprs)}", from_, where, groupby, having, orderby
+
+
+def _translate_distinct(node: Distinct) -> TranslateState:
+    select, from_, where, groupby, having, orderby = _translate(node.child)
+    if select.startswith("SELECT DISTINCT "):
+        return select, from_, where, groupby, having, orderby
+    if select.startswith("SELECT "):
+        return "SELECT DISTINCT " + select[len("SELECT "):], from_, where, groupby, having, orderby
+    return select, from_, where, groupby, having, orderby
+
+
+def _translate_orderby(node: OrderBy) -> TranslateState:
+    select, from_, where, groupby, having, _ = _translate(node.child)
+    agg_expr_map = _collect_agg_exprs(node.child)
+    orderby = ", ".join(_translate_order_key(key, agg_expr_map) for key in node.keys)
+    return select, from_, where, groupby, having, orderby
+
+
+def _translate_order_key(key: OrderKey, agg_expr_map: Optional[dict] = None) -> str:
+    agg_expr_map = agg_expr_map or {}
+    field_expr = agg_expr_map.get(key.field, _quote_field(key.field))
+    suffix = "DESC" if key.descending else "ASC"
+    return f"{field_expr} {suffix}"
 
 
 def _translate_aggregate(agg: Aggregate) -> str:
@@ -119,14 +179,7 @@ def _translate_aggregate(agg: Aggregate) -> str:
     return f"{expr} AS `{agg.alias}`"
 
 
-def _translate_having(node: Having):
-    select, from_, where, groupby, _ = _translate(node.child)
-    agg_expr_map = _collect_agg_exprs(node.child)
-    having = _translate_condition(node.condition, agg_expr_map=agg_expr_map)
-    return select, from_, where, groupby, having
-
-
-def _collect_agg_exprs(node) -> dict:
+def _collect_agg_exprs(node: QueryNode) -> dict:
     result = {}
     if isinstance(node, GroupBy):
         for agg in node.aggregates:
@@ -140,19 +193,16 @@ def _collect_agg_exprs(node) -> dict:
         result.update(_collect_agg_exprs(node.child))
     elif isinstance(node, Filter):
         result.update(_collect_agg_exprs(node.child))
+    elif isinstance(node, Project):
+        result.update(_collect_agg_exprs(node.child))
+    elif isinstance(node, Distinct):
+        result.update(_collect_agg_exprs(node.child))
+    elif isinstance(node, OrderBy):
+        result.update(_collect_agg_exprs(node.child))
     elif isinstance(node, Join):
         result.update(_collect_agg_exprs(node.left))
         result.update(_collect_agg_exprs(node.right))
     return result
-
-
-def _translate_project(node: Project):
-    select, from_, where, groupby, having = _translate(node.child)
-    agg_map = _collect_aggregates(node.child)
-    col_exprs = []
-    for field in node.fields:
-        col_exprs.append(agg_map[field] if field in agg_map else _quote_field(field))
-    return f"SELECT {', '.join(col_exprs)}", from_, where, groupby, having
 
 
 def _collect_aggregates(node: QueryNode) -> dict:
@@ -164,6 +214,12 @@ def _collect_aggregates(node: QueryNode) -> dict:
     elif isinstance(node, Having):
         result.update(_collect_aggregates(node.child))
     elif isinstance(node, Filter):
+        result.update(_collect_aggregates(node.child))
+    elif isinstance(node, Project):
+        result.update(_collect_aggregates(node.child))
+    elif isinstance(node, Distinct):
+        result.update(_collect_aggregates(node.child))
+    elif isinstance(node, OrderBy):
         result.update(_collect_aggregates(node.child))
     elif isinstance(node, Join):
         result.update(_collect_aggregates(node.left))

@@ -25,12 +25,15 @@ from ir.nodes import (
     CmpOp,
     Compare,
     Condition,
+    Distinct,
     Filter,
     GroupBy,
     Having,
     Join,
     JoinType,
     Not,
+    OrderBy,
+    OrderKey,
     Or,
     Project,
     QueryNode,
@@ -47,6 +50,7 @@ class GenContext:
     has_groupby: bool = False
     query_nullable_cols: set = field(default_factory=set)
     left_join_right_aliases: set = field(default_factory=set)
+    projected_fields: List[str] = field(default_factory=list)
 
 
 def generate_ir(
@@ -244,6 +248,19 @@ def _generate_ir_once(
     project_fields = _choose_project_fields(ctx, stress_mode=stress_mode, template=template)
     if project_fields:
         node = Project(fields=project_fields, child=node)
+        ctx.projected_fields = project_fields
+
+    if project_fields and _should_apply_distinct(stress_mode, template):
+        node = Distinct(child=node)
+
+    order_keys = _choose_orderby_keys(
+        project_fields,
+        ctx,
+        stress_mode=stress_mode,
+        template=template,
+    )
+    if order_keys:
+        node = OrderBy(keys=order_keys, child=node)
 
     return node, ctx
 
@@ -262,6 +279,10 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
         "force_null_compare": False,
         "force_right_projection": False,
         "force_duplicate_projection": False,
+        "require_distinct": False,
+        "require_orderby": False,
+        "prefer_orderby_agg": False,
+        "prefer_sparse_projection": False,
         "min_aggs": 1,
         "max_aggs": 2,
         "count_field_prob": 0.18,
@@ -278,6 +299,7 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
                 "min_aggs": 1,
                 "max_aggs": 2,
                 "count_field_prob": 0.25,
+                "require_orderby": True,
             }
         )
     elif stress_mode == "groupby_heavy":
@@ -291,6 +313,8 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
                 "max_aggs": 3,
                 "count_field_prob": 0.45,
                 "prefer_nullable_agg_field": True,
+                "require_orderby": True,
+                "prefer_orderby_agg": True,
             }
         )
     elif stress_mode == "duplicate_column_heavy":
@@ -299,6 +323,8 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
                 "target_joins": 1 if can_join else 0,
                 "force_duplicate_projection": True,
                 "count_field_prob": 0.22,
+                "require_distinct": True,
+                "prefer_sparse_projection": True,
             }
         )
     elif stress_mode == "null_heavy":
@@ -315,6 +341,31 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
                 "max_aggs": 2,
                 "count_field_prob": 0.35,
                 "prefer_nullable_agg_field": True,
+                "require_orderby": True,
+            }
+        )
+    elif stress_mode == "orderby_heavy":
+        template.update(
+            {
+                "target_joins": 2 if can_multi_join else (1 if can_join else 0),
+                "require_filter": True,
+                "require_orderby": True,
+                "force_right_projection": can_join,
+                "prefer_orderby_agg": True,
+                "min_aggs": 1,
+                "max_aggs": 2,
+                "count_field_prob": 0.4,
+            }
+        )
+    elif stress_mode == "distinct_heavy":
+        template.update(
+            {
+                "target_joins": 1 if can_join else 0,
+                "require_filter": True,
+                "require_distinct": True,
+                "prefer_sparse_projection": True,
+                "force_duplicate_projection": can_join,
+                "require_orderby": True,
             }
         )
 
@@ -347,17 +398,27 @@ def _ir_satisfies_stress_mode(
             return False
     if template.get("force_duplicate_projection") and not features["has_duplicate_projection"]:
         return False
+    if template.get("require_distinct") and not features["has_distinct"]:
+        return False
+    if template.get("require_orderby") and not features["has_orderby"]:
+        return False
+    if template.get("prefer_orderby_agg") and features["has_groupby"] and not features["has_orderby_agg"]:
+        return False
 
     if stress_mode == "join_heavy":
-        return features["has_join"]
+        return features["has_join"] and features["has_orderby"]
     if stress_mode == "groupby_heavy":
-        return features["has_groupby"] and features["has_having"]
+        return features["has_groupby"] and features["has_having"] and features["has_orderby_agg"]
     if stress_mode == "duplicate_column_heavy":
-        return features["has_duplicate_projection"]
+        return features["has_duplicate_projection"] and features["has_distinct"]
     if stress_mode == "null_heavy":
         if template.get("force_left_join") and not features["has_left_join"]:
             return False
-        return features["has_null_predicate"]
+        return features["has_null_predicate"] and features["has_orderby"]
+    if stress_mode == "orderby_heavy":
+        return features["has_orderby"]
+    if stress_mode == "distinct_heavy":
+        return features["has_distinct"]
     return True
 
 
@@ -371,6 +432,9 @@ def _collect_ir_features(node: QueryNode) -> Dict[str, object]:
         "has_null_predicate": False,
         "has_duplicate_projection": False,
         "has_left_join_right_projection": False,
+        "has_distinct": False,
+        "has_orderby": False,
+        "has_orderby_agg": False,
     }
     left_join_right_aliases = set()
 
@@ -429,6 +493,16 @@ def _collect_ir_features(node: QueryNode) -> Dict[str, object]:
             features["has_duplicate_projection"] = len(short_names) != len(set(short_names))
             if any(field_uses_left_join_right(field) for field in cur.fields):
                 features["has_left_join_right_projection"] = True
+            visit(cur.child)
+            return
+        if isinstance(cur, Distinct):
+            features["has_distinct"] = True
+            visit(cur.child)
+            return
+        if isinstance(cur, OrderBy):
+            features["has_orderby"] = True
+            if any("." not in key.field for key in cur.keys):
+                features["has_orderby_agg"] = True
             visit(cur.child)
 
     visit(node)
@@ -865,6 +939,12 @@ def _choose_project_fields(
     ]
     duplicate_fields = _pick_duplicate_short_name_fields(candidates)
 
+    if template and template.get("prefer_sparse_projection"):
+        preferred = duplicate_fields or right_fields or candidates
+        pick_num = random.randint(1, min(2, len(preferred)))
+        chosen = random.sample(preferred, pick_num)
+        return _extend_projection(candidates, chosen, extra_limit=0)
+
     if template and template.get("force_duplicate_projection") and duplicate_fields:
         return _extend_projection(candidates, duplicate_fields, extra_limit=2)
 
@@ -1052,6 +1132,89 @@ def _choose_join_type(
     return JoinType.LEFT if random.random() < left_prob else JoinType.INNER
 
 
+def _should_apply_distinct(
+    stress_mode: str,
+    template: Optional[Dict[str, object]] = None,
+) -> bool:
+    if template and template.get("require_distinct"):
+        return True
+
+    distinct_prob = 0.08
+    if stress_mode == "join_heavy":
+        distinct_prob = 0.12
+    elif stress_mode == "groupby_heavy":
+        distinct_prob = 0.14
+    elif stress_mode == "duplicate_column_heavy":
+        distinct_prob = 0.45
+    elif stress_mode == "null_heavy":
+        distinct_prob = 0.12
+    elif stress_mode == "orderby_heavy":
+        distinct_prob = 0.18
+    elif stress_mode == "distinct_heavy":
+        distinct_prob = 0.9
+
+    return random.random() < distinct_prob
+
+
+def _choose_orderby_keys(
+    project_fields: List[str],
+    ctx: GenContext,
+    stress_mode: str = "balanced",
+    template: Optional[Dict[str, object]] = None,
+) -> List[OrderKey]:
+    if not project_fields:
+        return []
+
+    if template and template.get("require_orderby"):
+        should_orderby = True
+    else:
+        orderby_prob = 0.1
+        if stress_mode == "join_heavy":
+            orderby_prob = 0.18
+        elif stress_mode == "groupby_heavy":
+            orderby_prob = 0.24
+        elif stress_mode == "duplicate_column_heavy":
+            orderby_prob = 0.16
+        elif stress_mode == "null_heavy":
+            orderby_prob = 0.22
+        elif stress_mode == "orderby_heavy":
+            orderby_prob = 0.95
+        elif stress_mode == "distinct_heavy":
+            orderby_prob = 0.65
+        should_orderby = random.random() < orderby_prob
+
+    if not should_orderby:
+        return []
+
+    unique_fields = _dedupe_keep_order(project_fields)
+    ordered_fields: List[str] = []
+
+    if template and template.get("prefer_orderby_agg"):
+        agg_fields = [field for field in unique_fields if field in ctx.agg_aliases]
+        other_fields = [field for field in unique_fields if field not in agg_fields]
+        ordered_fields.extend(agg_fields)
+        ordered_fields.extend(other_fields)
+    elif stress_mode in ("join_heavy", "null_heavy", "orderby_heavy"):
+        right_fields = [
+            field
+            for field in unique_fields
+            if "." in field and field.split(".", 1)[0] in ctx.left_join_right_aliases
+        ]
+        other_fields = [field for field in unique_fields if field not in right_fields]
+        ordered_fields.extend(right_fields)
+        ordered_fields.extend(other_fields)
+    else:
+        ordered_fields = unique_fields
+
+    if not ordered_fields:
+        return []
+
+    return [
+        OrderKey(field=field, descending=random.random() < 0.4)
+        for field in ordered_fields
+    ]
+
+
 def _apply_stress_mode(
     stress_mode: str,
     join_prob: float,
@@ -1087,6 +1250,20 @@ def _apply_stress_mode(
             min(1.0, groupby_prob + 0.35),
             min(1.0, having_prob + 0.28),
         )
+    if stress_mode == "orderby_heavy":
+        return (
+            min(1.0, join_prob + 0.2),
+            min(1.0, filter_prob + 0.12),
+            min(1.0, groupby_prob + 0.18),
+            min(1.0, having_prob + 0.1),
+        )
+    if stress_mode == "distinct_heavy":
+        return (
+            min(1.0, join_prob + 0.12),
+            min(1.0, filter_prob + 0.12),
+            min(1.0, groupby_prob + 0.05),
+            having_prob,
+        )
     return join_prob, filter_prob, groupby_prob, having_prob
 
 
@@ -1101,7 +1278,15 @@ if __name__ == "__main__":
     schema = generate_schema(num_tables=4, cols_per_table=3, fk_prob=0.8, seed=42)
     print_schema(schema)
     print()
-    for mode in ("balanced", "join_heavy", "groupby_heavy", "duplicate_column_heavy", "null_heavy"):
+    for mode in (
+        "balanced",
+        "join_heavy",
+        "groupby_heavy",
+        "duplicate_column_heavy",
+        "null_heavy",
+        "orderby_heavy",
+        "distinct_heavy",
+    ):
         ir, ctx = generate_ir(schema, stress_mode=mode, seed=7)
         print(f"--- mode={mode} ---")
         print(pretty_print(ir))

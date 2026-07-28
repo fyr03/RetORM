@@ -41,7 +41,7 @@ from generator.data_gen import generate_and_insert
 from translators.python_ref     import execute as ref_execute
 from translators.sql            import execute as sql_execute, translate as sql_translate
 from translators.sqlalchemy_orm import execute as orm_execute, reset_metadata
-from comparator.compare         import compare_all, print_report
+from comparator.compare         import compare_all, compare_two_paths, print_report
 from db.connector import (
     init_database, create_tables, drop_tables,
     execute_sql, dispose_engine,
@@ -54,6 +54,8 @@ from ir.nodes import (
     GroupBy,
     Having,
     Project,
+    Distinct,
+    OrderBy,
     Compare,
     And,
     Or,
@@ -132,7 +134,7 @@ class _StatsPrinter(threading.Thread):
         pass_rate   = f"{s.passed / total * 100:.1f}%" if total else "N/A"
         empty_rate  = f"{s.empty_results / total * 100:.1f}%" if total else "N/A"
         error_rate  = f"{s.errors / total * 100:.1f}%" if total else "N/A"
-        bug_total   = s.sql_bugs + s.orm_bugs
+        bug_total   = s.sql_bugs + s.orm_bugs + s.sql_orm_divergences
         bug_rate    = f"{bug_total / total * 100:.1f}%" if total else "N/A"
 
         # 速度：queries per minute
@@ -141,7 +143,7 @@ class _StatsPrinter(threading.Thread):
         lines = [
             f"[运行统计]  耗时={elapsed}s  速度={qpm} q/min , 查询总数  : {total}",
             f"  通过      : {s.passed}  ({pass_rate}),  空结果    : {s.empty_results}  ({empty_rate}),  执行错误  : {s.errors}  ({error_rate})",
-            f"  SQL bug   : {s.sql_bugs},  ORM bug   : {s.orm_bugs},  bug 合计  : {bug_total}  ({bug_rate})",
+            f"  SQL bug   : {s.sql_bugs},  ORM bug   : {s.orm_bugs},  SQL/ORM diff  : {s.sql_orm_divergences},  bug 合计  : {bug_total}  ({bug_rate})",
             f"  结构覆盖  : 单表={s.single_table_queries}, Join={s.join_queries}, LEFT JOIN={s.left_join_queries}, Filter={s.filter_queries}, GroupBy={s.groupby_queries}, Having={s.having_queries}, 重复投影={s.duplicate_proj_queries}, NULL谓词={s.null_predicate_queries}",
         ]
         lines = _format_run_stats_lines(
@@ -173,6 +175,7 @@ class BugReport:
     ref_rows:     list
     sql_rows:     list
     orm_rows:     list
+    sql_vs_orm:   object = None   # CompareResult
     sql_text:     str = ""        # 生成的 SQL 字符串
     error:        Optional[str] = None
 
@@ -183,6 +186,8 @@ class RunStats:
     passed:        int = 0
     sql_bugs:      int = 0
     orm_bugs:      int = 0
+    sql_orm_divergences: int = 0
+    ref_path_anomalies: int = 0
     errors:        int = 0
     empty_results: int = 0
     single_table_queries:   int = 0
@@ -194,6 +199,9 @@ class RunStats:
     null_predicate_queries: int = 0
     left_join_queries:      int = 0
     multi_join_queries:     int = 0
+    distinct_queries:       int = 0
+    orderby_queries:        int = 0
+    orderby_agg_queries:    int = 0
     left_join_null_queries: int = 0
     left_join_groupby_queries: int = 0
     left_join_having_queries: int = 0
@@ -215,7 +223,60 @@ def _report_has_actionable_bug(report: BugReport) -> bool:
         return True
     if report.ref_vs_sql is None or report.ref_vs_orm is None:
         return False
+    if report.sql_vs_orm is not None and not report.sql_vs_orm.match:
+        return True
     return (not report.ref_vs_sql.match) or (not report.ref_vs_orm.match)
+
+
+def _get_report_category(report: BugReport) -> tuple[str, str, str]:
+    if report.error:
+        return "execution_error", "Execution Error", report.error
+
+    ref_vs_sql = report.ref_vs_sql
+    ref_vs_orm = report.ref_vs_orm
+    sql_vs_orm = report.sql_vs_orm
+    sql_mismatch = ref_vs_sql is not None and not ref_vs_sql.match
+    orm_mismatch = ref_vs_orm is not None and not ref_vs_orm.match
+    sql_orm_mismatch = sql_vs_orm is not None and not sql_vs_orm.match
+
+    if not sql_mismatch and not orm_mismatch:
+        return "consistent", "Consistent", ""
+
+    if sql_vs_orm is not None and sql_vs_orm.match:
+        reason = (
+            f"sql_vs_orm: match | ref_vs_sql: {ref_vs_sql.reason} | "
+            f"ref_vs_orm: {ref_vs_orm.reason}"
+        )
+        return "ref_path_anomaly", "Ref Path Anomaly", reason
+
+    if sql_vs_orm is None and sql_mismatch and (not orm_mismatch):
+        return "sql_bug", "SQL Bug", ref_vs_sql.reason
+
+    if sql_vs_orm is None and orm_mismatch and (not sql_mismatch):
+        return "orm_bug", "ORM Bug", ref_vs_orm.reason
+
+    if sql_orm_mismatch and (not sql_mismatch) and orm_mismatch:
+        return "orm_bug", "ORM Bug", ref_vs_orm.reason
+
+    if sql_orm_mismatch and sql_mismatch and (not orm_mismatch):
+        return "sql_bug", "SQL Bug", ref_vs_sql.reason
+
+    if sql_orm_mismatch:
+        reason_parts = []
+        if sql_vs_orm is not None:
+            reason_parts.append(f"sql_vs_orm: {sql_vs_orm.reason}")
+        if sql_mismatch:
+            reason_parts.append(f"ref_vs_sql: {ref_vs_sql.reason}")
+        if orm_mismatch:
+            reason_parts.append(f"ref_vs_orm: {ref_vs_orm.reason}")
+        return "sql_orm_divergence", "SQL/ORM Divergence", " | ".join(reason_parts)
+
+    reason_parts = []
+    if sql_mismatch:
+        reason_parts.append(f"ref_vs_sql: {ref_vs_sql.reason}")
+    if orm_mismatch:
+        reason_parts.append(f"ref_vs_orm: {ref_vs_orm.reason}")
+    return "ref_path_anomaly", "Ref Path Anomaly", " | ".join(reason_parts)
 
 
 def _classify_bug_report(report: BugReport) -> tuple[str, str]:
@@ -224,6 +285,9 @@ def _classify_bug_report(report: BugReport) -> tuple[str, str]:
     CompareResult.__bool__ returns ``match``, so boolean checks can invert the
     intended control flow for mismatches.
     """
+    _, label, reason = _get_report_category(report)
+    return label, reason
+
     if report.error:
         return "鎵ц寮傚父", report.error
 
@@ -314,23 +378,7 @@ def _write_bug_detail(report: BugReport) -> str:
     sep = "=" * 70
 
     # ── 确定 bug 类型 ──
-    if report.error:
-        bug_type = "执行异常"
-        reason   = report.error
-    elif (report.ref_vs_sql is not None and not report.ref_vs_sql.match and
-          report.ref_vs_orm is not None and not report.ref_vs_orm.match):
-        bug_type = "ref 路径可能有 bug（ref vs sql 和 ref vs orm 均不一致）"
-        reason   = (f"ref_vs_sql: {report.ref_vs_sql.reason} | "
-                    f"ref_vs_orm: {report.ref_vs_orm.reason}")
-    elif report.ref_vs_sql is not None and not report.ref_vs_sql.match:
-        bug_type = "SQL 翻译器 bug"
-        reason   = report.ref_vs_sql.reason
-    elif report.ref_vs_orm is not None and not report.ref_vs_orm.match:
-        bug_type = "ORM bug"
-        reason   = report.ref_vs_orm.reason
-    else:
-        bug_type = "未知（三路均一致，不应出现）"
-        reason   = ""
+    _, bug_type, reason = _get_report_category(report)
 
     lines = [
         sep,
@@ -406,6 +454,8 @@ def _write_bug_detail(report: BugReport) -> str:
         lines.append(f"  ref vs sql 不一致: {report.ref_vs_sql.reason}")
     if report.ref_vs_orm is not None and not report.ref_vs_orm.match:
         lines.append(f"  ref vs orm 不一致: {report.ref_vs_orm.reason}")
+    if report.sql_vs_orm is not None and not report.sql_vs_orm.match:
+        lines.append(f"  sql vs orm 不一致: {report.sql_vs_orm.reason}")
 
     lines.append(sep)
 
@@ -438,23 +488,7 @@ def _write_bug_file(report: BugReport, bug_dir: str, bug_idx: int) -> str:
     fpath = os.path.join(bug_dir, f"bug_{bug_idx:03d}.py")
 
     # ── 确定 bug 类型 ──
-    if report.error:
-        bug_type = "执行异常"
-        reason   = report.error
-    elif (report.ref_vs_sql is not None and not report.ref_vs_sql.match and
-          report.ref_vs_orm is not None and not report.ref_vs_orm.match):
-        bug_type = "ref 路径可能有 bug（ref vs sql 和 ref vs orm 均不一致）"
-        reason   = (f"ref_vs_sql: {report.ref_vs_sql.reason} | "
-                    f"ref_vs_orm: {report.ref_vs_orm.reason}")
-    elif report.ref_vs_sql is not None and not report.ref_vs_sql.match:
-        bug_type = "SQL 翻译器 bug"
-        reason   = report.ref_vs_sql.reason
-    elif report.ref_vs_orm is not None and not report.ref_vs_orm.match:
-        bug_type = "ORM bug ⚠️"
-        reason   = report.ref_vs_orm.reason
-    else:
-        bug_type = "未知（三路均一致，不应出现）"
-        reason   = ""
+    _, bug_type, reason = _get_report_category(report)
 
     # ── 生成建表 SQL ──
     from generator.schema_gen import generate_create_sqls, generate_drop_sqls
@@ -497,6 +531,7 @@ def _write_bug_file(report: BugReport, bug_dir: str, bug_idx: int) -> str:
     from translators.sqlalchemy_orm import execute as orm_execute, reset_metadata
     from comparator.compare         import compare_all, print_report
     from ir.nodes import *
+    from runner import _query_requires_ordered_compare
 
     # ── 1. 建表 ────────────────────────────────────────────────────────────
     init_database()
@@ -529,7 +564,10 @@ def _write_bug_file(report: BugReport, bug_dir: str, bug_idx: int) -> str:
     print(f"orm 结果 ({{len(orm_rows)}} 行): {{orm_rows}}")
 
     # ── 6. 比较 ────────────────────────────────────────────────────────────
-    ref_vs_sql, ref_vs_orm = compare_all(ref_rows, sql_rows, orm_rows)
+    ordered = _query_requires_ordered_compare(ir)
+    ref_vs_sql, ref_vs_orm = compare_all(
+        ref_rows, sql_rows, orm_rows, ordered=ordered
+    )
     print_report(ref_vs_sql, ref_vs_orm)
 
     # ── 7. 清理 ────────────────────────────────────────────────────────────
@@ -561,6 +599,7 @@ def _gen_ir_code(node) -> str:
     """把当前 IR 对象序列化为可直接执行的 Python 构造代码。"""
     from ir.nodes import Scan, Filter, Join, GroupBy, Having, Project
     from ir.nodes import Compare, And, Or, Not, Aggregate
+    from ir.nodes import Distinct, OrderBy, OrderKey
 
     if isinstance(node, Scan):
         return f"Scan(table={node.table!r}, alias={node.alias!r})"
@@ -590,6 +629,16 @@ def _gen_ir_code(node) -> str:
         )
     if isinstance(node, Project):
         return f"Project(fields={node.fields!r}, child={_gen_ir_code(node.child)})"
+    if isinstance(node, Distinct):
+        return f"Distinct(child={_gen_ir_code(node.child)})"
+    if isinstance(node, OrderBy):
+        keys = ", ".join(_gen_ir_code(key) for key in node.keys)
+        return f"OrderBy(keys=[{keys}], child={_gen_ir_code(node.child)})"
+    if isinstance(node, OrderKey):
+        return (
+            f"OrderKey(field={node.field!r}, "
+            f"descending={node.descending!r})"
+        )
     if isinstance(node, Compare):
         return (
             f"Compare(field={node.field!r}, op=CmpOp.{node.op.name}, "
@@ -802,7 +851,13 @@ def run(
 
                 # 6. 比较
                 try:
-                    ref_vs_sql, ref_vs_orm = compare_all(ref_rows, sql_rows, orm_rows)
+                    ordered = _query_requires_ordered_compare(ir)
+                    ref_vs_sql, ref_vs_orm = compare_all(
+                        ref_rows, sql_rows, orm_rows, ordered=ordered
+                    )
+                    sql_vs_orm = compare_two_paths(
+                        sql_rows, orm_rows, "sql", "orm", ordered=ordered
+                    )
                 except Exception as e:
                     msg = f"[比较失败] {e}"
                     print(msg); dlog(msg)
@@ -817,7 +872,7 @@ def run(
                     print("(空结果)", end="")
                     stats.empty_results += 1
 
-                if ref_vs_sql.match and ref_vs_orm.match:
+                if ref_vs_sql.match and ref_vs_orm.match and sql_vs_orm.match:
                     print("✓")
                     # 通过时一行总结，verbose 时附上三路结果
                     if verbose:
@@ -829,12 +884,32 @@ def run(
                              + ("  [空结果]" if all_empty else ""))
                     stats.passed += 1
                 else:
-                    if not ref_vs_sql.match:
-                        tag = "✗ SQL bug"
+                    report = BugReport(
+                        schema_id=schema_id, query_id=query_id,
+                        schema=schema, ir=ir, ir_str=ir_str,
+                        schema_seed=schema_seed, query_seed=query_seed,
+                        table_data=table_data,
+                        rows_per_table=rows_per_table,
+                        use_z3=use_z3,
+                        z3_timeout=config.Z3_TIMEOUT_SEC,
+                        ref_vs_sql=ref_vs_sql, ref_vs_orm=ref_vs_orm,
+                        ref_rows=ref_rows, sql_rows=sql_rows, orm_rows=orm_rows,
+                        sql_vs_orm=sql_vs_orm,
+                        sql_text=sql_text,
+                    )
+                    bug_category, tag, reason = _get_report_category(report)
+                    if bug_category == "sql_bug":
                         stats.sql_bugs += 1
-                    else:
-                        tag = "✗ ORM bug ⚠️"
+                        tag = "✗ SQL bug"
+                    elif bug_category == "orm_bug":
                         stats.orm_bugs += 1
+                        tag = "✗ ORM bug ⚠️"
+                    elif bug_category == "sql_orm_divergence":
+                        stats.sql_orm_divergences += 1
+                        tag = "✗ SQL/ORM divergence ⚠️"
+                    else:
+                        stats.ref_path_anomalies += 1
+                        tag = "△ ref path anomaly"
 
                     print(tag)
                     dlog(f"  ref({len(ref_rows)}行) sql({len(sql_rows)}行) "
@@ -850,18 +925,6 @@ def run(
                         print(report_str)
                     dlog(report_str)
 
-                    report = BugReport(
-                        schema_id=schema_id, query_id=query_id,
-                        schema=schema, ir=ir, ir_str=ir_str,
-                        schema_seed=schema_seed, query_seed=query_seed,
-                        table_data=table_data,
-                        rows_per_table=rows_per_table,
-                        use_z3=use_z3,
-                        z3_timeout=config.Z3_TIMEOUT_SEC,
-                        ref_vs_sql=ref_vs_sql, ref_vs_orm=ref_vs_orm,
-                        ref_rows=ref_rows, sql_rows=sql_rows, orm_rows=orm_rows,
-                        sql_text=sql_text,
-                    )
                     bug_idx = _persist_bug_report(
                         report, stats, bug_dir, bug_idx, dlog
                     )
@@ -916,7 +979,9 @@ def run(
     run_logger.info(f"  执行错误  : {s.errors}")
     run_logger.info(f"  SQL bug   : {s.sql_bugs}")
     run_logger.info(f"  ORM bug   : {s.orm_bugs}  ← 重点关注")
-    run_logger.info(f"  bug 合计  : {s.sql_bugs + s.orm_bugs}")
+    run_logger.info(f"  SQL/ORM diff : {s.sql_orm_divergences}")
+    run_logger.info(f"  ref anomaly  : {s.ref_path_anomalies}")
+    run_logger.info(f"  bug 合计  : {s.sql_bugs + s.orm_bugs + s.sql_orm_divergences}")
     run_logger.info(
         "  结构覆盖  : "
         f"单表={s.single_table_queries}  Join={s.join_queries}  LEFT JOIN={s.left_join_queries}  "
@@ -968,6 +1033,12 @@ def _record_query_shape(stats: RunStats, ir) -> None:
         stats.multi_join_queries += 1
     if features["has_left_join"]:
         stats.left_join_queries += 1
+    if features["has_distinct"]:
+        stats.distinct_queries += 1
+    if features["has_orderby"]:
+        stats.orderby_queries += 1
+    if features["has_orderby_agg"]:
+        stats.orderby_agg_queries += 1
     if features["has_left_join_null"]:
         stats.left_join_null_queries += 1
     if features["has_left_join_groupby"]:
@@ -1001,6 +1072,9 @@ def _collect_query_features(node) -> dict:
         "has_duplicate_projection": False,
         "has_null_predicate": False,
         "has_left_join": False,
+        "has_distinct": False,
+        "has_orderby": False,
+        "has_orderby_agg": False,
         "has_left_join_null": False,
         "has_left_join_groupby": False,
         "has_left_join_having": False,
@@ -1023,6 +1097,10 @@ def _collect_query_features(node) -> dict:
         if isinstance(cur, Having):
             return collect_aliases(cur.child)
         if isinstance(cur, Project):
+            return collect_aliases(cur.child)
+        if isinstance(cur, Distinct):
+            return collect_aliases(cur.child)
+        if isinstance(cur, OrderBy):
             return collect_aliases(cur.child)
         return set()
 
@@ -1078,6 +1156,18 @@ def _collect_query_features(node) -> dict:
             if any(field_uses_left_join_right(field) for field in cur.fields):
                 features["has_left_join_right_projection"] = True
             return
+        if isinstance(cur, Distinct):
+            features["has_distinct"] = True
+            visit(cur.child)
+            return
+        if isinstance(cur, OrderBy):
+            features["has_orderby"] = True
+            if any("." not in key.field for key in cur.keys):
+                features["has_orderby_agg"] = True
+            if any(field_uses_left_join_right(key.field) for key in cur.keys):
+                features["has_left_join_right_projection"] = True
+            visit(cur.child)
+            return
         if isinstance(cur, Scan):
             return
 
@@ -1093,6 +1183,10 @@ def _short_field_name(field_name: str) -> str:
     return field_name.split(".", 1)[1] if "." in field_name else field_name
 
 
+def _query_requires_ordered_compare(node) -> bool:
+    return _collect_query_features(node)["has_orderby"]
+
+
 def _format_run_stats_lines(
     stats: RunStats,
     elapsed: int,
@@ -1102,12 +1196,12 @@ def _format_run_stats_lines(
     error_rate: str,
     bug_rate: str,
 ) -> List[str]:
-    bug_total = stats.sql_bugs + stats.orm_bugs
+    bug_total = stats.sql_bugs + stats.orm_bugs + stats.sql_orm_divergences
     return [
         f"[running log]  time={elapsed}s  speed={qpm} q/min , query  : {stats.total_queries}",
         f"  passed      : {stats.passed}  ({pass_rate}),  empty results   : {stats.empty_results}  ({empty_rate}),  errors  : {stats.errors}  ({error_rate})",
-        f"  SQL bug   : {stats.sql_bugs},  ORM bug   : {stats.orm_bugs},  bug total  : {bug_total}  ({bug_rate})",
-        f"  structure coverage  : single table={stats.single_table_queries}, join={stats.join_queries}, multi join={stats.multi_join_queries}, left join={stats.left_join_queries}, filter={stats.filter_queries}, group by={stats.groupby_queries}, having={stats.having_queries}, duplicate projection={stats.duplicate_proj_queries}, null predicate={stats.null_predicate_queries}",
+        f"  SQL bug   : {stats.sql_bugs},  ORM bug   : {stats.orm_bugs},  SQL/ORM diff  : {stats.sql_orm_divergences},  ref anomaly  : {stats.ref_path_anomalies},  bug total  : {bug_total}  ({bug_rate})",
+        f"  structure coverage  : single table={stats.single_table_queries}, join={stats.join_queries}, multi join={stats.multi_join_queries}, left join={stats.left_join_queries}, filter={stats.filter_queries}, group by={stats.groupby_queries}, having={stats.having_queries}, distinct={stats.distinct_queries}, order by={stats.orderby_queries}, order by agg={stats.orderby_agg_queries}, duplicate projection={stats.duplicate_proj_queries}, null predicate={stats.null_predicate_queries}",
         f"  left join combinations  : LEFT+NULL={stats.left_join_null_queries}, LEFT+GroupBy={stats.left_join_groupby_queries}, LEFT+Having={stats.left_join_having_queries}, LEFT+right projection={stats.left_join_right_proj_queries}, LEFT+right predicate={stats.left_join_right_predicate_queries}",
     ]
 
@@ -1121,6 +1215,8 @@ def _print_final_report(stats: RunStats, bug_dir: str = "bugs") -> None:
     print(f"  执行错误    : {stats.errors}")
     print(f"  SQL 翻译 bug: {stats.sql_bugs}")
     print(f"  ORM bug     : {stats.orm_bugs}")
+    print(f"  SQL/ORM diff: {stats.sql_orm_divergences}")
+    print(f"  ref anomaly : {stats.ref_path_anomalies}")
     print("  Structure Coverage    :")
     print(f"    single table      : {stats.single_table_queries}")
     print(f"    Join      : {stats.join_queries}")
@@ -1129,6 +1225,9 @@ def _print_final_report(stats: RunStats, bug_dir: str = "bugs") -> None:
     print(f"    Filter    : {stats.filter_queries}")
     print(f"    GroupBy   : {stats.groupby_queries}")
     print(f"    Having    : {stats.having_queries}")
+    print(f"    Distinct  : {stats.distinct_queries}")
+    print(f"    OrderBy   : {stats.orderby_queries}")
+    print(f"    OrderByAgg: {stats.orderby_agg_queries}")
     print(f"    duplicate_proj_queries  : {stats.duplicate_proj_queries}")
     print(f"    NULL Pred   : {stats.null_predicate_queries}")
     print("  left join combinations    :")
@@ -1153,17 +1252,9 @@ def _print_final_report(stats: RunStats, bug_dir: str = "bugs") -> None:
             print(f"  类型: 执行异常")
             print(f"  错误: {r.error}")
         else:
-            if (r.ref_vs_sql is not None and not r.ref_vs_sql.match and
-                    r.ref_vs_orm is not None and not r.ref_vs_orm.match):
-                print(f"  类型: ref 路径可能有 bug")
-                print(f"  原因(sql): {r.ref_vs_sql.reason}")
-                print(f"  原因(orm): {r.ref_vs_orm.reason}")
-            elif r.ref_vs_sql is not None and not r.ref_vs_sql.match:
-                print(f"  类型: SQL 翻译器 bug")
-                print(f"  原因: {r.ref_vs_sql.reason}")
-            elif r.ref_vs_orm is not None and not r.ref_vs_orm.match:
-                print(f"  类型: ORM bug ⚠️")
-                print(f"  原因: {r.ref_vs_orm.reason}")
+            _, label, reason = _get_report_category(r)
+            print(f"  类型: {label}")
+            print(f"  原因: {reason}")
             print(f"  ref ({len(r.ref_rows)}行): {r.ref_rows[:3]}"
                   f"{'...' if len(r.ref_rows) > 3 else ''}")
             print(f"  sql ({len(r.sql_rows)}行): {r.sql_rows[:3]}"
@@ -1183,6 +1274,8 @@ def _choose_stress_mode(query_seed: int, stats: Optional[RunStats] = None) -> st
         "groupby_heavy": 1.0,
         "duplicate_column_heavy": 0.9,
         "null_heavy": 0.9,
+        "orderby_heavy": 1.0,
+        "distinct_heavy": 0.9,
     }
 
     if stats is not None and stats.total_queries > 0:
@@ -1197,20 +1290,26 @@ def _choose_stress_mode(query_seed: int, stats: Optional[RunStats] = None) -> st
         left_join_gap = deficit(stats.left_join_queries, 0.08)
         groupby_gap = deficit(stats.groupby_queries, 0.45)
         having_gap = deficit(stats.having_queries, 0.3)
+        distinct_gap = deficit(stats.distinct_queries, 0.12)
+        orderby_gap = deficit(stats.orderby_queries, 0.18)
+        orderby_agg_gap = deficit(stats.orderby_agg_queries, 0.06)
         duplicate_gap = deficit(stats.duplicate_proj_queries, 0.12)
         null_gap = deficit(stats.null_predicate_queries, 0.08)
         left_combo_gap = deficit(stats.left_join_null_queries, 0.025)
         right_proj_gap = deficit(stats.left_join_right_proj_queries, 0.04)
 
         weights["join_heavy"] += 2.6 * join_gap + 2.2 * multi_join_gap + 1.6 * right_proj_gap
-        weights["groupby_heavy"] += 2.8 * groupby_gap + 1.8 * having_gap
-        weights["duplicate_column_heavy"] += 3.4 * duplicate_gap
+        weights["groupby_heavy"] += 2.8 * groupby_gap + 1.8 * having_gap + 1.8 * orderby_agg_gap
+        weights["duplicate_column_heavy"] += 2.4 * duplicate_gap + 1.6 * distinct_gap
         weights["null_heavy"] += 2.6 * null_gap + 2.2 * left_join_gap + 1.8 * left_combo_gap
+        weights["orderby_heavy"] += 3.0 * orderby_gap + 1.4 * right_proj_gap + 1.2 * orderby_agg_gap
+        weights["distinct_heavy"] += 2.8 * distinct_gap + 1.6 * duplicate_gap
 
         if total < 50:
             weights["balanced"] *= 0.7
             weights["join_heavy"] += 0.6
             weights["groupby_heavy"] += 0.4
+            weights["orderby_heavy"] += 0.4
 
     total_weight = sum(weights.values())
     roll = rng.random() * total_weight
