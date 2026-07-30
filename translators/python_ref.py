@@ -5,6 +5,7 @@ Path 1: reference execution in Python.
 """
 
 import math
+import re
 import sys
 from collections import defaultdict
 from typing import Any, Dict, List
@@ -16,22 +17,29 @@ from ir.nodes import (
     AggFunc,
     Aggregate,
     And,
+    ArithExpr,
+    ArithOp,
+    Between,
+    CaseWhen,
+    CmpOp,
     Compare,
     Condition,
     Distinct,
     Filter,
     GroupBy,
     Having,
+    InList,
     Join,
     JoinType,
+    Like,
+    LimitOffset,
     Not,
     Or,
     OrderBy,
-    OrderKey,
     Project,
     QueryNode,
     Scan,
-    CmpOp,
+    SelectItem,
 )
 
 
@@ -60,6 +68,8 @@ def _eval(node: QueryNode) -> Rows:
         return _eval_distinct(node)
     if isinstance(node, OrderBy):
         return _eval_orderby(node)
+    if isinstance(node, LimitOffset):
+        return _eval_limit_offset(node)
     raise NotImplementedError(f"unknown node type: {type(node)}")
 
 
@@ -99,16 +109,19 @@ def _eval_groupby(node: GroupBy) -> Rows:
     groups: Dict[tuple, Rows] = defaultdict(list)
     for row in rows:
         group_key = tuple(
-            None if (isinstance(v, float) and v != v) else v
-            for v in (_resolve_field(field, row) for field in node.fields)
+            _normalize_group_atom(_eval_expr(field, row, prefer_field=True))
+            for field in node.fields
         )
         groups[group_key].append(row)
 
     result = []
     for group_key, group_rows in groups.items():
         out_row: Row = {}
-        for field_name, value in zip(node.fields, group_key):
-            out_row[field_name] = value
+        for field, value in zip(node.fields, group_key):
+            if isinstance(field, str):
+                out_row[field] = value
+            else:
+                out_row[repr(field)] = value
         for agg in node.aggregates:
             out_row[agg.alias] = _compute_aggregate(agg, group_rows)
         result.append(out_row)
@@ -119,9 +132,13 @@ def _compute_aggregate(agg: Aggregate, rows: Rows) -> Any:
     if agg.func == AggFunc.COUNT:
         if agg.field == "*":
             return len(rows)
-        return sum(1 for row in rows if _resolve_field(agg.field, row) is not None)
+        return sum(
+            1
+            for row in rows
+            if _eval_expr(agg.field, row, prefer_field=True) is not None
+        )
 
-    values = [_resolve_field(agg.field, row) for row in rows]
+    values = [_eval_expr(agg.field, row, prefer_field=True) for row in rows]
     values = [value for value in values if value is not None]
     if not values:
         return None
@@ -146,7 +163,13 @@ def _eval_project(node: Project) -> Rows:
     rows = _eval(node.child)
     result = []
     for row in rows:
-        result.append({field_name: _resolve_field(field_name, row) for field_name in node.fields})
+        out_row: Row = {}
+        for field in node.fields:
+            if isinstance(field, SelectItem):
+                out_row[field.alias] = _eval_expr(field.expr, row, prefer_field=True)
+            else:
+                out_row[field] = _eval_expr(field, row, prefer_field=True)
+        result.append(out_row)
     return result
 
 
@@ -165,13 +188,19 @@ def _eval_distinct(node: Distinct) -> Rows:
 
 def _eval_orderby(node: OrderBy) -> Rows:
     rows = list(_eval(node.child))
-    # Use stable multi-pass sorting so mixed ASC/DESC keys behave like SQL.
     for key in reversed(node.keys):
         rows.sort(
-            key=lambda row: _sort_atom(_resolve_field(key.field, row)),
+            key=lambda row: _sort_atom(_eval_expr(key.field, row, prefer_field=True)),
             reverse=key.descending,
         )
     return rows
+
+
+def _eval_limit_offset(node: LimitOffset) -> Rows:
+    rows = _eval(node.child)
+    start = max(0, node.offset)
+    end = start + max(0, node.limit)
+    return rows[start:end]
 
 
 def _sort_atom(value: Any):
@@ -199,13 +228,10 @@ def _eval_condition(cond: Condition, row: Row) -> bool:
 
 def _eval_condition_3vl(cond: Condition, row: Row):
     if isinstance(cond, Compare):
-        left_val = _resolve_field(cond.field, row)
-        if isinstance(cond.value, str) and "." in cond.value:
-            right_val = _resolve_field(cond.value, row)
-        else:
-            right_val = cond.value
+        left_val = _eval_expr(cond.field, row, prefer_field=True)
+        right_val = _eval_expr(cond.value, row, prefer_field=True)
 
-        if right_val is None and not (isinstance(cond.value, str) and "." in str(cond.value)):
+        if right_val is None and _expr_is_literal_none(cond.value):
             if cond.op == CmpOp.EQ:
                 return left_val is None
             if cond.op == CmpOp.NEQ:
@@ -214,6 +240,34 @@ def _eval_condition_3vl(cond: Condition, row: Row):
         if left_val is None or right_val is None:
             return None
         return _compare(left_val, cond.op, right_val)
+
+    if isinstance(cond, InList):
+        left_val = _eval_expr(cond.field, row, prefer_field=True)
+        if left_val is None:
+            return None
+        values = [_eval_expr(value, row, prefer_field=True) for value in cond.values]
+        if any(value is None for value in values):
+            values = [value for value in values if value is not None]
+        result = left_val in values
+        return (not result) if cond.negated else result
+
+    if isinstance(cond, Between):
+        value = _eval_expr(cond.field, row, prefer_field=True)
+        lower = _eval_expr(cond.lower, row, prefer_field=True)
+        upper = _eval_expr(cond.upper, row, prefer_field=True)
+        if value is None or lower is None or upper is None:
+            return None
+        result = lower <= value <= upper
+        return (not result) if cond.negated else result
+
+    if isinstance(cond, Like):
+        value = _eval_expr(cond.field, row, prefer_field=True)
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            value = str(value)
+        result = _like_match(value, cond.pattern)
+        return (not result) if cond.negated else result
 
     if isinstance(cond, And):
         left = _eval_condition_3vl(cond.left, row)
@@ -242,6 +296,46 @@ def _eval_condition_3vl(cond: Condition, row: Row):
     raise NotImplementedError(f"unknown condition type: {type(cond)}")
 
 
+def _eval_expr(expr, row: Row, prefer_field: bool = True):
+    if isinstance(expr, ArithExpr):
+        left = _eval_expr(expr.left, row, prefer_field=True)
+        right = _eval_expr(expr.right, row, prefer_field=True)
+        if left is None or right is None:
+            return None
+        return _eval_arith(left, expr.op, right)
+
+    if isinstance(expr, CaseWhen):
+        for case in expr.cases:
+            if _eval_condition(case.condition, row):
+                return _eval_expr(case.value, row, prefer_field=True)
+        return _eval_expr(expr.else_value, row, prefer_field=False)
+
+    if isinstance(expr, str) and prefer_field:
+        resolved = _resolve_field(expr, row)
+        if resolved is not _UNRESOLVED:
+            return resolved
+
+    return expr
+
+
+def _eval_arith(left: Any, op: ArithOp, right: Any):
+    if op == ArithOp.ADD:
+        return left + right
+    if op == ArithOp.SUB:
+        return left - right
+    if op == ArithOp.MUL:
+        return left * right
+    if op == ArithOp.DIV:
+        if right == 0:
+            return None
+        return left / right
+    if op == ArithOp.MOD:
+        if right == 0:
+            return None
+        return left % right
+    raise NotImplementedError(f"unknown arithmetic op: {op}")
+
+
 def _compare(left: Any, op: CmpOp, right: Any) -> bool:
     if left is None or right is None:
         return False
@@ -260,7 +354,33 @@ def _compare(left: Any, op: CmpOp, right: Any) -> bool:
     raise NotImplementedError(f"unknown compare op: {op}")
 
 
-def _resolve_field(field_name: str, row: Row) -> Any:
+def _normalize_group_atom(value: Any):
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    return value
+
+
+def _like_match(value: str, pattern: str) -> bool:
+    regex = "^" + "".join(_translate_like_char(ch) for ch in pattern) + "$"
+    return re.match(regex, value, flags=re.DOTALL) is not None
+
+
+def _translate_like_char(ch: str) -> str:
+    if ch == "%":
+        return ".*"
+    if ch == "_":
+        return "."
+    return re.escape(ch)
+
+
+def _expr_is_literal_none(expr) -> bool:
+    return expr is None
+
+
+_UNRESOLVED = object()
+
+
+def _resolve_field(field_name: str, row: Row):
     if field_name in row:
         return row[field_name]
 
@@ -275,4 +395,4 @@ def _resolve_field(field_name: str, row: Row) -> Any:
             )
             return matches[0]
 
-    return None
+    return _UNRESOLVED

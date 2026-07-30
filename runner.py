@@ -47,6 +47,10 @@ from db.connector import (
     execute_sql, dispose_engine,
 )
 from ir.nodes import (
+    ArithExpr,
+    ArithOp,
+    Between,
+    CaseWhen,
     pretty_print,
     Scan,
     Filter,
@@ -55,7 +59,12 @@ from ir.nodes import (
     Having,
     Project,
     Distinct,
+    InList,
+    Like,
+    LimitOffset,
     OrderBy,
+    SelectItem,
+    WhenClause,
     Compare,
     And,
     Or,
@@ -202,6 +211,12 @@ class RunStats:
     distinct_queries:       int = 0
     orderby_queries:        int = 0
     orderby_agg_queries:    int = 0
+    limit_offset_queries:   int = 0
+    in_list_predicate_queries: int = 0
+    between_predicate_queries: int = 0
+    like_predicate_queries: int = 0
+    arithmetic_expr_queries: int = 0
+    case_when_queries:      int = 0
     left_join_null_queries: int = 0
     left_join_groupby_queries: int = 0
     left_join_having_queries: int = 0
@@ -597,9 +612,31 @@ def _gen_insert_code(schema, table_data: dict) -> str:
 
 def _gen_ir_code(node) -> str:
     """把当前 IR 对象序列化为可直接执行的 Python 构造代码。"""
-    from ir.nodes import Scan, Filter, Join, GroupBy, Having, Project
-    from ir.nodes import Compare, And, Or, Not, Aggregate
-    from ir.nodes import Distinct, OrderBy, OrderKey
+    from ir.nodes import (
+        Aggregate,
+        And,
+        ArithExpr,
+        ArithOp,
+        Between,
+        CaseWhen,
+        Compare,
+        Distinct,
+        Filter,
+        GroupBy,
+        Having,
+        InList,
+        Join,
+        Like,
+        LimitOffset,
+        Not,
+        Or,
+        OrderBy,
+        OrderKey,
+        Project,
+        Scan,
+        SelectItem,
+        WhenClause,
+    )
 
     if isinstance(node, Scan):
         return f"Scan(table={node.table!r}, alias={node.alias!r})"
@@ -618,7 +655,7 @@ def _gen_ir_code(node) -> str:
     if isinstance(node, GroupBy):
         aggs = ", ".join(_gen_ir_code(agg) for agg in node.aggregates)
         return (
-            f"GroupBy(fields={node.fields!r}, "
+            f"GroupBy(fields=[{', '.join(_gen_ir_code(field) for field in node.fields)}], "
             f"aggregates=[{aggs}], "
             f"child={_gen_ir_code(node.child)})"
         )
@@ -628,21 +665,58 @@ def _gen_ir_code(node) -> str:
             f"child={_gen_ir_code(node.child)})"
         )
     if isinstance(node, Project):
-        return f"Project(fields={node.fields!r}, child={_gen_ir_code(node.child)})"
+        fields = ", ".join(_gen_ir_code(field) for field in node.fields)
+        return f"Project(fields=[{fields}], child={_gen_ir_code(node.child)})"
     if isinstance(node, Distinct):
         return f"Distinct(child={_gen_ir_code(node.child)})"
     if isinstance(node, OrderBy):
         keys = ", ".join(_gen_ir_code(key) for key in node.keys)
         return f"OrderBy(keys=[{keys}], child={_gen_ir_code(node.child)})"
+    if isinstance(node, LimitOffset):
+        return (
+            f"LimitOffset(limit={node.limit!r}, offset={node.offset!r}, "
+            f"child={_gen_ir_code(node.child)})"
+        )
     if isinstance(node, OrderKey):
         return (
-            f"OrderKey(field={node.field!r}, "
+            f"OrderKey(field={_gen_ir_code(node.field)}, "
             f"descending={node.descending!r})"
+        )
+    if isinstance(node, SelectItem):
+        return f"SelectItem(expr={_gen_ir_code(node.expr)}, alias={node.alias!r})"
+    if isinstance(node, ArithExpr):
+        return (
+            f"ArithExpr(left={_gen_ir_code(node.left)}, "
+            f"op=ArithOp.{node.op.name}, right={_gen_ir_code(node.right)})"
+        )
+    if isinstance(node, CaseWhen):
+        cases = ", ".join(_gen_ir_code(case) for case in node.cases)
+        return f"CaseWhen(cases=[{cases}], else_value={_gen_ir_code(node.else_value)})"
+    if isinstance(node, WhenClause):
+        return (
+            f"WhenClause(condition={_gen_ir_code(node.condition)}, "
+            f"value={_gen_ir_code(node.value)})"
         )
     if isinstance(node, Compare):
         return (
-            f"Compare(field={node.field!r}, op=CmpOp.{node.op.name}, "
-            f"value={node.value!r})"
+            f"Compare(field={_gen_ir_code(node.field)}, op=CmpOp.{node.op.name}, "
+            f"value={_gen_ir_code(node.value)})"
+        )
+    if isinstance(node, InList):
+        values = ", ".join(_gen_ir_code(value) for value in node.values)
+        return (
+            f"InList(field={_gen_ir_code(node.field)}, values=[{values}], "
+            f"negated={node.negated!r})"
+        )
+    if isinstance(node, Between):
+        return (
+            f"Between(field={_gen_ir_code(node.field)}, lower={_gen_ir_code(node.lower)}, "
+            f"upper={_gen_ir_code(node.upper)}, negated={node.negated!r})"
+        )
+    if isinstance(node, Like):
+        return (
+            f"Like(field={_gen_ir_code(node.field)}, pattern={node.pattern!r}, "
+            f"negated={node.negated!r})"
         )
     if isinstance(node, And):
         return f"And(left={_gen_ir_code(node.left)}, right={_gen_ir_code(node.right)})"
@@ -653,8 +727,12 @@ def _gen_ir_code(node) -> str:
     if isinstance(node, Aggregate):
         return (
             f"Aggregate(func=AggFunc.{node.func.name}, "
-            f"field={node.field!r}, alias={node.alias!r})"
+            f"field={_gen_ir_code(node.field)}, alias={node.alias!r})"
         )
+    if isinstance(node, str):
+        return repr(node)
+    if isinstance(node, (int, float)) or node is None:
+        return repr(node)
     raise TypeError(f"不支持序列化的 IR 节点: {type(node)}")
 
 
@@ -1039,6 +1117,18 @@ def _record_query_shape(stats: RunStats, ir) -> None:
         stats.orderby_queries += 1
     if features["has_orderby_agg"]:
         stats.orderby_agg_queries += 1
+    if features["has_limit_offset"]:
+        stats.limit_offset_queries += 1
+    if features["has_in_list"]:
+        stats.in_list_predicate_queries += 1
+    if features["has_between"]:
+        stats.between_predicate_queries += 1
+    if features["has_like"]:
+        stats.like_predicate_queries += 1
+    if features["has_arithmetic_expr"]:
+        stats.arithmetic_expr_queries += 1
+    if features["has_case_when"]:
+        stats.case_when_queries += 1
     if features["has_left_join_null"]:
         stats.left_join_null_queries += 1
     if features["has_left_join_groupby"]:
@@ -1075,6 +1165,12 @@ def _collect_query_features(node) -> dict:
         "has_distinct": False,
         "has_orderby": False,
         "has_orderby_agg": False,
+        "has_limit_offset": False,
+        "has_in_list": False,
+        "has_between": False,
+        "has_like": False,
+        "has_arithmetic_expr": False,
+        "has_case_when": False,
         "has_left_join_null": False,
         "has_left_join_groupby": False,
         "has_left_join_having": False,
@@ -1102,6 +1198,8 @@ def _collect_query_features(node) -> dict:
             return collect_aliases(cur.child)
         if isinstance(cur, OrderBy):
             return collect_aliases(cur.child)
+        if isinstance(cur, LimitOffset):
+            return collect_aliases(cur.child)
         return set()
 
     def field_uses_left_join_right(field_name: str) -> bool:
@@ -1109,12 +1207,55 @@ def _collect_query_features(node) -> dict:
             return False
         return field_name.split(".", 1)[0] in left_join_right_aliases
 
+    def project_field_name(field) -> str:
+        if isinstance(field, SelectItem):
+            return field.alias
+        return str(field)
+
+    def visit_expr(expr):
+        if isinstance(expr, ArithExpr):
+            features["has_arithmetic_expr"] = True
+            visit_expr(expr.left)
+            visit_expr(expr.right)
+            return
+        if isinstance(expr, CaseWhen):
+            features["has_case_when"] = True
+            for case_item in expr.cases:
+                visit_condition(case_item.condition, track_right_usage=True)
+                visit_expr(case_item.value)
+            visit_expr(expr.else_value)
+            return
+
     def visit_condition(cond, track_right_usage=False):
         if isinstance(cond, Compare):
             if cond.value is None:
                 features["has_null_predicate"] = True
             if track_right_usage and field_uses_left_join_right(cond.field):
                 features["has_left_join_right_predicate"] = True
+            visit_expr(cond.field)
+            visit_expr(cond.value)
+            return
+        if isinstance(cond, InList):
+            features["has_in_list"] = True
+            if track_right_usage and field_uses_left_join_right(cond.field):
+                features["has_left_join_right_predicate"] = True
+            visit_expr(cond.field)
+            for value in cond.values:
+                visit_expr(value)
+            return
+        if isinstance(cond, Between):
+            features["has_between"] = True
+            if track_right_usage and field_uses_left_join_right(cond.field):
+                features["has_left_join_right_predicate"] = True
+            visit_expr(cond.field)
+            visit_expr(cond.lower)
+            visit_expr(cond.upper)
+            return
+        if isinstance(cond, Like):
+            features["has_like"] = True
+            if track_right_usage and field_uses_left_join_right(cond.field):
+                features["has_left_join_right_predicate"] = True
+            visit_expr(cond.field)
             return
         if isinstance(cond, And) or isinstance(cond, Or):
             visit_condition(cond.left, track_right_usage)
@@ -1143,6 +1284,10 @@ def _collect_query_features(node) -> dict:
         if isinstance(cur, GroupBy):
             features["has_groupby"] = True
             visit(cur.child)
+            for field in cur.fields:
+                visit_expr(field)
+            for agg in cur.aggregates:
+                visit_expr(agg.field)
             return
         if isinstance(cur, Having):
             features["has_having"] = True
@@ -1151,10 +1296,16 @@ def _collect_query_features(node) -> dict:
             return
         if isinstance(cur, Project):
             visit(cur.child)
-            short_names = [_short_field_name(field) for field in cur.fields]
+            short_names = [_short_field_name(project_field_name(field)) for field in cur.fields]
             features["has_duplicate_projection"] = len(short_names) != len(set(short_names))
-            if any(field_uses_left_join_right(field) for field in cur.fields):
+            if any(
+                isinstance(field, str) and field_uses_left_join_right(field)
+                for field in cur.fields
+            ):
                 features["has_left_join_right_projection"] = True
+            for field in cur.fields:
+                if isinstance(field, SelectItem):
+                    visit_expr(field.expr)
             return
         if isinstance(cur, Distinct):
             features["has_distinct"] = True
@@ -1162,10 +1313,16 @@ def _collect_query_features(node) -> dict:
             return
         if isinstance(cur, OrderBy):
             features["has_orderby"] = True
-            if any("." not in key.field for key in cur.keys):
+            if any(isinstance(key.field, str) and "." not in key.field for key in cur.keys):
                 features["has_orderby_agg"] = True
-            if any(field_uses_left_join_right(key.field) for key in cur.keys):
+            if any(isinstance(key.field, str) and field_uses_left_join_right(key.field) for key in cur.keys):
                 features["has_left_join_right_projection"] = True
+            for key in cur.keys:
+                visit_expr(key.field)
+            visit(cur.child)
+            return
+        if isinstance(cur, LimitOffset):
+            features["has_limit_offset"] = True
             visit(cur.child)
             return
         if isinstance(cur, Scan):
@@ -1202,6 +1359,7 @@ def _format_run_stats_lines(
         f"  passed      : {stats.passed}  ({pass_rate}),  empty results   : {stats.empty_results}  ({empty_rate}),  errors  : {stats.errors}  ({error_rate})",
         f"  SQL bug   : {stats.sql_bugs},  ORM bug   : {stats.orm_bugs},  SQL/ORM diff  : {stats.sql_orm_divergences},  ref anomaly  : {stats.ref_path_anomalies},  bug total  : {bug_total}  ({bug_rate})",
         f"  structure coverage  : single table={stats.single_table_queries}, join={stats.join_queries}, multi join={stats.multi_join_queries}, left join={stats.left_join_queries}, filter={stats.filter_queries}, group by={stats.groupby_queries}, having={stats.having_queries}, distinct={stats.distinct_queries}, order by={stats.orderby_queries}, order by agg={stats.orderby_agg_queries}, duplicate projection={stats.duplicate_proj_queries}, null predicate={stats.null_predicate_queries}",
+        f"  syntax coverage  : limit/offset={stats.limit_offset_queries}, IN={stats.in_list_predicate_queries}, BETWEEN={stats.between_predicate_queries}, LIKE={stats.like_predicate_queries}, arithmetic={stats.arithmetic_expr_queries}, CASE={stats.case_when_queries}",
         f"  left join combinations  : LEFT+NULL={stats.left_join_null_queries}, LEFT+GroupBy={stats.left_join_groupby_queries}, LEFT+Having={stats.left_join_having_queries}, LEFT+right projection={stats.left_join_right_proj_queries}, LEFT+right predicate={stats.left_join_right_predicate_queries}",
     ]
 
@@ -1228,6 +1386,12 @@ def _print_final_report(stats: RunStats, bug_dir: str = "bugs") -> None:
     print(f"    Distinct  : {stats.distinct_queries}")
     print(f"    OrderBy   : {stats.orderby_queries}")
     print(f"    OrderByAgg: {stats.orderby_agg_queries}")
+    print(f"    LimitOffset: {stats.limit_offset_queries}")
+    print(f"    IN Pred   : {stats.in_list_predicate_queries}")
+    print(f"    BETWEEN   : {stats.between_predicate_queries}")
+    print(f"    LIKE Pred : {stats.like_predicate_queries}")
+    print(f"    ArithExpr : {stats.arithmetic_expr_queries}")
+    print(f"    CASE WHEN : {stats.case_when_queries}")
     print(f"    duplicate_proj_queries  : {stats.duplicate_proj_queries}")
     print(f"    NULL Pred   : {stats.null_predicate_queries}")
     print("  left join combinations    :")

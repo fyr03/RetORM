@@ -3,6 +3,7 @@
 import os
 import sys
 import types
+import importlib.util
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -38,20 +39,38 @@ from generator.schema_gen import ColType, Column, TableSchema
 from ir.nodes import (
     AggFunc,
     Aggregate,
+    And,
+    ArithExpr,
+    ArithOp,
+    Between,
+    CaseWhen,
     Compare,
     CmpOp,
     Distinct,
     Filter,
     GroupBy,
     Having,
+    InList,
     Join,
     JoinType,
+    Like,
+    LimitOffset,
     OrderBy,
     OrderKey,
+    Or,
     Project,
     Scan,
+    SelectItem,
+    WhenClause,
 )
-from translators.python_ref import _eval_condition_3vl, _eval_distinct, _eval_join, _eval_orderby
+from translators.python_ref import (
+    _eval_condition_3vl,
+    _eval_distinct,
+    _eval_join,
+    _eval_limit_offset,
+    _eval_orderby,
+    _eval_project,
+)
 from translators.sql import translate
 from runner import (
     BugReport,
@@ -65,7 +84,7 @@ from runner import (
 
 
 def _unwrap_wrappers(node):
-    while isinstance(node, (Distinct, OrderBy)):
+    while isinstance(node, (Distinct, OrderBy, LimitOffset)):
         node = node.child
     return node
 
@@ -218,7 +237,12 @@ def test_ir_generator_null_heavy_can_emit_null_predicates():
         "generator.ir_gen.random.choice",
         side_effect=["i.nullable_score", CmpOp.EQ],
     ):
-        cond = _generate_condition(ctx, schema=None, stress_mode="null_heavy")
+        cond = _generate_condition(
+            ctx,
+            schema=None,
+            stress_mode="null_heavy",
+            template={"force_null_compare": True},
+        )
 
     assert isinstance(cond, Compare)
     assert cond.field == "i.nullable_score"
@@ -302,6 +326,73 @@ def test_sql_translate_supports_distinct_and_orderby():
     assert "DESC" in sql
 
 
+def test_sql_translate_supports_limit_offset_and_extended_predicates():
+    ir = LimitOffset(
+        limit=5,
+        offset=2,
+        child=OrderBy(
+            keys=[OrderKey(ArithExpr("o.amount", ArithOp.ADD, 1), descending=True)],
+            child=Project(
+                fields=[
+                    "o.id",
+                    SelectItem(
+                        expr=CaseWhen(
+                            cases=[WhenClause(Compare("o.amount", CmpOp.GTE, 10), 1)],
+                            else_value=0,
+                        ),
+                        alias="amount_bucket",
+                    ),
+                ],
+                child=Filter(
+                    condition=And(
+                        Between("o.amount", 1, 10),
+                        Or(Like("o.code", "a%"), InList("o.status", ["dup", "edge"])),
+                    ),
+                    child=Scan("orders", "o"),
+                ),
+            ),
+        ),
+    )
+
+    sql = translate(ir)
+    assert "LIMIT 5 OFFSET 2" in sql
+    assert "BETWEEN" in sql
+    assert "LIKE" in sql
+    assert "IN (" in sql
+    assert "CASE WHEN" in sql
+
+
+def test_sql_translate_case_when_over_aggregate_alias_uses_plain_aggregate_expr():
+    ir = Project(
+        fields=[
+            "u.num",
+            "max_u_val",
+            SelectItem(
+                expr=CaseWhen(
+                    cases=[WhenClause(Compare("max_u_val", CmpOp.GTE, 50), 1)],
+                    else_value=0,
+                ),
+                alias="max_u_val_bucket",
+            ),
+        ],
+        child=Having(
+            condition=Compare("max_u_val", CmpOp.LT, 70),
+            child=GroupBy(
+                fields=["u.num"],
+                aggregates=[
+                    Aggregate(AggFunc.MAX, "u.val", "max_u_val"),
+                ],
+                child=Scan("users", "u"),
+            ),
+        ),
+    )
+
+    sql = translate(ir)
+    assert "MAX(`u`.`val`) AS `max_u_val`" in sql
+    assert "CASE WHEN MAX(`u`.`val`) >= 50 THEN 1 ELSE 0 END" in sql
+    assert "CASE WHEN MAX(`u`.`val`) AS `max_u_val` >= 50" not in sql
+
+
 def test_python_ref_null_compare_matches_is_null_semantics():
     row = {"u.score": None, "u.id": 1}
     not_null_row = {"u.score": 7, "u.id": 2}
@@ -375,6 +466,51 @@ def test_python_ref_orderby_applies_mixed_direction_keys():
         {"o.id": 1, "o.amount": 10},
         {"o.id": 2, "o.amount": 10},
     ]
+
+
+def test_python_ref_project_supports_case_when_and_arithmetic():
+    node = Project(
+        fields=[
+            "o.id",
+            SelectItem(expr=ArithExpr("o.amount", ArithOp.ADD, 2), alias="amount_plus_2"),
+            SelectItem(
+                expr=CaseWhen(
+                    cases=[WhenClause(Compare("o.amount", CmpOp.GTE, 10), 1)],
+                    else_value=0,
+                ),
+                alias="amount_bucket",
+            ),
+        ],
+        child=Scan("orders", "o"),
+    )
+
+    with patch("translators.python_ref._eval", return_value=[
+        {"o.id": 1, "o.amount": 8},
+        {"o.id": 2, "o.amount": 12},
+    ]):
+        rows = _eval_project(node)
+
+    assert rows == [
+        {"o.id": 1, "amount_plus_2": 10, "amount_bucket": 0},
+        {"o.id": 2, "amount_plus_2": 14, "amount_bucket": 1},
+    ]
+
+
+def test_python_ref_extended_predicates_and_limit_offset():
+    row = {"o.amount": 9, "o.code": "alpha", "o.status": "dup"}
+    assert _eval_condition_3vl(Between("o.amount", 1, 10), row) is True
+    assert _eval_condition_3vl(Like("o.code", "a%"), row) is True
+    assert _eval_condition_3vl(InList("o.status", ["dup", "edge"]), row) is True
+
+    node = LimitOffset(limit=2, offset=1, child=Scan("orders", "o"))
+    with patch("translators.python_ref._eval", return_value=[
+        {"o.id": 1},
+        {"o.id": 2},
+        {"o.id": 3},
+        {"o.id": 4},
+    ]):
+        rows = _eval_limit_offset(node)
+    assert rows == [{"o.id": 2}, {"o.id": 3}]
 
 
 def test_data_gen_null_heavy_raises_null_probability():
@@ -463,7 +599,7 @@ def test_ir_generator_groupby_heavy_enforces_groupby_and_having():
 
     ir, _ = generate_ir(schema, stress_mode="groupby_heavy", seed=7)
 
-    assert isinstance(ir, OrderBy)
+    assert _collect_query_features(ir)["has_orderby"] is True
     core = _unwrap_wrappers(ir)
     assert isinstance(core, Project)
     assert isinstance(core.child, Having)
@@ -570,6 +706,84 @@ def test_runner_collects_distinct_and_orderby_features():
     assert features["has_distinct"] is True
     assert features["has_orderby"] is True
     assert features["has_orderby_agg"] is True
+
+
+def test_runner_collects_extended_syntax_features():
+    ir = LimitOffset(
+        limit=3,
+        offset=1,
+        child=OrderBy(
+            keys=[OrderKey(ArithExpr("o.amount", ArithOp.ADD, 1), descending=True)],
+            child=Project(
+                fields=[
+                    "o.id",
+                    SelectItem(
+                        expr=CaseWhen(
+                            cases=[WhenClause(Compare("o.amount", CmpOp.GTE, 10), 1)],
+                            else_value=0,
+                        ),
+                        alias="bucket",
+                    ),
+                ],
+                child=Filter(
+                    condition=And(
+                        Between("o.amount", 1, 10),
+                        Or(Like("o.code", "a%"), InList("o.status", ["dup", "edge"])),
+                    ),
+                    child=Scan("orders", "o"),
+                ),
+            ),
+        ),
+    )
+
+    features = _collect_query_features(ir)
+    assert features["has_limit_offset"] is True
+    assert features["has_between"] is True
+    assert features["has_like"] is True
+    assert features["has_in_list"] is True
+    assert features["has_arithmetic_expr"] is True
+    assert features["has_case_when"] is True
+
+
+def test_connector_execute_sql_without_params_does_not_pass_empty_args():
+    connector_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "db",
+        "connector.py",
+    )
+    spec = importlib.util.spec_from_file_location("retorm_db_connector_real", connector_path)
+    connector_mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(connector_mod)
+
+    calls = []
+
+    class FakeCursor:
+        def execute(self, *args):
+            calls.append(args)
+
+        def fetchall(self):
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            return None
+
+    with patch.object(connector_mod, "get_connection", return_value=FakeConn()):
+        connector_mod.execute_sql("SELECT 1 WHERE 'a%';")
+        connector_mod.execute_sql("SELECT * FROM t WHERE id = %s", (1,))
+
+    assert calls[0] == ("SELECT 1 WHERE 'a%';",)
+    assert calls[1] == ("SELECT * FROM t WHERE id = %s", (1,))
 
 
 def test_runner_skips_all_matched_bug_reports():
@@ -749,10 +963,13 @@ if __name__ == "__main__":
     test_sql_translate_supports_left_join()
     test_sql_translate_supports_nested_join_chain()
     test_sql_translate_supports_distinct_and_orderby()
+    test_sql_translate_supports_limit_offset_and_extended_predicates()
     test_python_ref_null_compare_matches_is_null_semantics()
     test_python_ref_left_join_null_extends_unmatched_rows()
     test_python_ref_distinct_removes_duplicate_rows()
     test_python_ref_orderby_applies_mixed_direction_keys()
+    test_python_ref_project_supports_case_when_and_arithmetic()
+    test_python_ref_extended_predicates_and_limit_offset()
     test_data_gen_null_heavy_raises_null_probability()
     test_data_gen_row_budget_adds_edge_and_adversarial_rows()
     test_ir_generator_groupby_sampling_respects_preferred_pool_size()

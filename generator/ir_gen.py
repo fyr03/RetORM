@@ -22,6 +22,10 @@ from ir.nodes import (
     AggFunc,
     Aggregate,
     And,
+    ArithExpr,
+    ArithOp,
+    Between,
+    CaseWhen,
     CmpOp,
     Compare,
     Condition,
@@ -29,8 +33,11 @@ from ir.nodes import (
     Filter,
     GroupBy,
     Having,
+    InList,
     Join,
     JoinType,
+    Like,
+    LimitOffset,
     Not,
     OrderBy,
     OrderKey,
@@ -38,6 +45,8 @@ from ir.nodes import (
     Project,
     QueryNode,
     Scan,
+    SelectItem,
+    WhenClause,
 )
 
 
@@ -246,6 +255,12 @@ def _generate_ir_once(
                 node = Having(condition=having_cond, child=node)
 
     project_fields = _choose_project_fields(ctx, stress_mode=stress_mode, template=template)
+    project_fields = _maybe_wrap_project_fields(
+        project_fields,
+        ctx,
+        stress_mode=stress_mode,
+        template=template,
+    )
     if project_fields:
         node = Project(fields=project_fields, child=node)
         ctx.projected_fields = project_fields
@@ -261,6 +276,11 @@ def _generate_ir_once(
     )
     if order_keys:
         node = OrderBy(keys=order_keys, child=node)
+
+    if order_keys and _should_apply_limit_offset(stress_mode, template):
+        limit = random.randint(1, 5)
+        offset = random.randint(0, 3)
+        node = LimitOffset(limit=limit, offset=offset, child=node)
 
     return node, ctx
 
@@ -435,6 +455,7 @@ def _collect_ir_features(node: QueryNode) -> Dict[str, object]:
         "has_distinct": False,
         "has_orderby": False,
         "has_orderby_agg": False,
+        "has_limit_offset": False,
     }
     left_join_right_aliases = set()
 
@@ -457,12 +478,19 @@ def _collect_ir_features(node: QueryNode) -> Dict[str, object]:
             if cond.value is None:
                 features["has_null_predicate"] = True
             return
+        if isinstance(cond, (InList, Between, Like)):
+            return
         if isinstance(cond, (And, Or)):
             visit_condition(cond.left)
             visit_condition(cond.right)
             return
         if isinstance(cond, Not):
             visit_condition(cond.child)
+
+    def project_field_name(field) -> str:
+        if isinstance(field, SelectItem):
+            return field.alias
+        return str(field)
 
     def visit(cur: QueryNode) -> None:
         if isinstance(cur, Join):
@@ -489,9 +517,11 @@ def _collect_ir_features(node: QueryNode) -> Dict[str, object]:
             visit(cur.child)
             return
         if isinstance(cur, Project):
-            short_names = [_short_field_name(field) for field in cur.fields]
+            short_names = [_short_field_name(project_field_name(field)) for field in cur.fields]
             features["has_duplicate_projection"] = len(short_names) != len(set(short_names))
-            if any(field_uses_left_join_right(field) for field in cur.fields):
+            if any(
+                field_uses_left_join_right(field) for field in cur.fields if isinstance(field, str)
+            ):
                 features["has_left_join_right_projection"] = True
             visit(cur.child)
             return
@@ -501,8 +531,12 @@ def _collect_ir_features(node: QueryNode) -> Dict[str, object]:
             return
         if isinstance(cur, OrderBy):
             features["has_orderby"] = True
-            if any("." not in key.field for key in cur.keys):
+            if any(isinstance(key.field, str) and "." not in key.field for key in cur.keys):
                 features["has_orderby_agg"] = True
+            visit(cur.child)
+            return
+        if isinstance(cur, LimitOffset):
+            features["has_limit_offset"] = True
             visit(cur.child)
 
     visit(node)
@@ -570,6 +604,15 @@ def _get_numeric_cols(ctx: GenContext) -> List[str]:
     for alias, table in ctx.tables.items():
         for col in table.columns:
             if col.col_type in (ColType.INT, ColType.FLOAT):
+                result.append(f"{alias}.{col.name}")
+    return result
+
+
+def _get_string_cols(ctx: GenContext) -> List[str]:
+    result = []
+    for alias, table in ctx.tables.items():
+        for col in table.columns:
+            if col.col_type == ColType.VARCHAR:
                 result.append(f"{alias}.{col.name}")
     return result
 
@@ -764,17 +807,19 @@ def _generate_condition(
     template: Optional[Dict[str, object]] = None,
 ) -> Optional[Condition]:
     numeric_cols = _get_numeric_cols(ctx)
+    string_cols = _get_string_cols(ctx)
     nullable_numeric_cols = _get_nullable_numeric_cols(ctx)
     nullable_visible_cols = _get_nullable_visible_cols(ctx)
     left_join_right_numeric_cols = _get_left_join_right_numeric_cols(ctx)
     left_join_right_visible_cols = _get_left_join_right_visible_cols(ctx)
 
-    if not numeric_cols and not nullable_visible_cols:
+    if not numeric_cols and not nullable_visible_cols and not string_cols:
         return None
 
     if template and template.get("force_null_compare") and nullable_visible_cols:
         forced = _make_compare(
             numeric_cols,
+            string_cols,
             nullable_numeric_cols,
             nullable_visible_cols,
             left_join_right_numeric_cols,
@@ -788,6 +833,7 @@ def _generate_condition(
     if depth >= 2:
         return _make_compare(
             numeric_cols,
+            string_cols,
             nullable_numeric_cols,
             nullable_visible_cols,
             left_join_right_numeric_cols,
@@ -796,9 +842,22 @@ def _generate_condition(
         )
 
     roll = random.random()
-    if roll < 0.55:
+    if string_cols and roll < 0.18:
+        cond = _make_like(string_cols)
+        if cond is not None:
+            return cond
+    if numeric_cols and roll < 0.34:
+        cond = _make_between(numeric_cols)
+        if cond is not None:
+            return cond
+    if (numeric_cols or string_cols) and roll < 0.5:
+        cond = _make_in_list(numeric_cols, string_cols)
+        if cond is not None:
+            return cond
+    if roll < 0.72:
         return _make_compare(
             numeric_cols,
+            string_cols,
             nullable_numeric_cols,
             nullable_visible_cols,
             left_join_right_numeric_cols,
@@ -820,6 +879,7 @@ def _generate_condition(
 
     child = _make_compare(
         numeric_cols,
+        string_cols,
         nullable_numeric_cols,
         nullable_visible_cols,
         left_join_right_numeric_cols,
@@ -831,6 +891,7 @@ def _generate_condition(
 
 def _make_compare(
     numeric_cols: List[str],
+    string_cols: List[str],
     nullable_numeric_cols: List[str],
     nullable_visible_cols: List[str],
     left_join_right_numeric_cols: List[str],
@@ -838,7 +899,7 @@ def _make_compare(
     stress_mode: str,
     force_null: bool = False,
 ) -> Optional[Compare]:
-    if not numeric_cols and not nullable_visible_cols:
+    if not numeric_cols and not nullable_visible_cols and not string_cols:
         return None
 
     if force_null and nullable_visible_cols:
@@ -868,6 +929,10 @@ def _make_compare(
         return Compare(col, op, None)
 
     if not numeric_cols:
+        if string_cols:
+            col = random.choice(string_cols)
+            op = random.choice([CmpOp.EQ, CmpOp.NEQ])
+            return Compare(col, op, _random_string_literal())
         return None
 
     pool = numeric_cols
@@ -884,6 +949,43 @@ def _make_compare(
     op = random.choice([CmpOp.GT, CmpOp.GTE, CmpOp.LT, CmpOp.LTE, CmpOp.EQ])
     val = random.randint(0, 100)
     return Compare(col, op, val)
+
+
+def _make_in_list(numeric_cols: List[str], string_cols: List[str]) -> Optional[Condition]:
+    choices = []
+    if numeric_cols:
+        choices.append("numeric")
+    if string_cols:
+        choices.append("string")
+    if not choices:
+        return None
+
+    chosen = random.choice(choices)
+    if chosen == "numeric":
+        field = random.choice(numeric_cols)
+        base = random.randint(0, 100)
+        values = [base, base + 1, max(0, base - 1)]
+    else:
+        field = random.choice(string_cols)
+        values = [_random_string_literal() for _ in range(3)]
+    return InList(field=field, values=values, negated=(random.random() < 0.25))
+
+
+def _make_between(numeric_cols: List[str]) -> Optional[Condition]:
+    if not numeric_cols:
+        return None
+    field = random.choice(numeric_cols)
+    lower = random.randint(0, 60)
+    upper = random.randint(lower, 100)
+    return Between(field=field, lower=lower, upper=upper, negated=(random.random() < 0.2))
+
+
+def _make_like(string_cols: List[str]) -> Optional[Condition]:
+    if not string_cols:
+        return None
+    field = random.choice(string_cols)
+    pattern = random.choice(["a%", "%a", "%dup%", "_dge", "%z%"])
+    return Like(field=field, pattern=pattern, negated=(random.random() < 0.2))
 
 
 def _generate_having_condition(
@@ -910,7 +1012,7 @@ def _choose_project_fields(
     ctx: GenContext,
     stress_mode: str = "balanced",
     template: Optional[Dict[str, object]] = None,
-) -> List[str]:
+) -> List[object]:
     candidates = ctx.group_fields + ctx.agg_aliases if ctx.has_groupby else ctx.visible_cols
     if not candidates:
         return []
@@ -977,6 +1079,62 @@ def _choose_project_fields(
     return random.sample(candidates, pick_num)
 
 
+def _maybe_wrap_project_fields(
+    fields: List[object],
+    ctx: GenContext,
+    stress_mode: str = "balanced",
+    template: Optional[Dict[str, object]] = None,
+) -> List[object]:
+    if not fields:
+        return fields
+
+    wrapped = list(fields)
+    numeric_candidates = [
+        field
+        for field in wrapped
+        if isinstance(field, str) and _field_is_numeric(ctx, field)
+    ]
+
+    if numeric_candidates and random.random() < 0.22:
+        base_field = random.choice(numeric_candidates)
+        alias = f"{_short_field_name(base_field)}_calc"
+        wrapped.append(
+            SelectItem(
+                expr=ArithExpr(
+                    left=base_field,
+                    op=random.choice([ArithOp.ADD, ArithOp.SUB, ArithOp.MUL]),
+                    right=random.randint(1, 5),
+                ),
+                alias=alias,
+            )
+        )
+
+    case_candidates = [
+        field
+        for field in wrapped
+        if isinstance(field, str) and _field_is_numeric(ctx, field)
+    ]
+    if case_candidates and random.random() < 0.18:
+        base_field = random.choice(case_candidates)
+        alias = f"{_short_field_name(base_field)}_bucket"
+        wrapped.append(
+            SelectItem(
+                expr=CaseWhen(
+                    cases=[
+                        WhenClause(
+                            condition=Compare(base_field, CmpOp.GTE, 50),
+                            value=1,
+                        )
+                    ],
+                    else_value=0,
+                ),
+                alias=alias,
+            )
+        )
+
+    return _dedupe_projection_outputs(wrapped)
+
+
 def _extend_projection(
     candidates: List[str],
     chosen: List[str],
@@ -991,6 +1149,18 @@ def _extend_projection(
     return chosen
 
 
+def _dedupe_projection_outputs(fields: List[object]) -> List[object]:
+    seen = set()
+    result = []
+    for field in fields:
+        name = _projection_output_name(field)
+        if name in seen:
+            continue
+        seen.add(name)
+        result.append(field)
+    return result
+
+
 def _dedupe_keep_order(items: List[str]) -> List[str]:
     seen = set()
     result = []
@@ -1000,6 +1170,37 @@ def _dedupe_keep_order(items: List[str]) -> List[str]:
         seen.add(item)
         result.append(item)
     return result
+
+
+def _projection_output_name(field: object) -> str:
+    if isinstance(field, SelectItem):
+        return field.alias
+    return str(field)
+
+
+def _projection_order_expr(field: object):
+    if isinstance(field, SelectItem):
+        return field.expr
+    return field
+
+
+def _field_is_numeric(ctx: GenContext, field_name: str) -> bool:
+    if field_name in ctx.agg_aliases:
+        return True
+    if "." not in field_name:
+        return False
+    alias, col_name = field_name.split(".", 1)
+    table = ctx.tables.get(alias)
+    if table is None:
+        return False
+    column = table.get_column(col_name)
+    if column is None:
+        return False
+    return column.col_type in (ColType.INT, ColType.FLOAT)
+
+
+def _random_string_literal() -> str:
+    return random.choice(["a", "dup", "edge", "", "z"])
 
 
 def _pick_duplicate_short_name_fields(fields: List[str]) -> List[str]:
@@ -1156,8 +1357,32 @@ def _should_apply_distinct(
     return random.random() < distinct_prob
 
 
+def _should_apply_limit_offset(
+    stress_mode: str,
+    template: Optional[Dict[str, object]] = None,
+) -> bool:
+    limit_offset_prob = 0.06
+    if stress_mode == "join_heavy":
+        limit_offset_prob = 0.1
+    elif stress_mode == "groupby_heavy":
+        limit_offset_prob = 0.12
+    elif stress_mode == "duplicate_column_heavy":
+        limit_offset_prob = 0.08
+    elif stress_mode == "null_heavy":
+        limit_offset_prob = 0.12
+    elif stress_mode == "orderby_heavy":
+        limit_offset_prob = 0.38
+    elif stress_mode == "distinct_heavy":
+        limit_offset_prob = 0.18
+
+    if template and template.get("require_orderby"):
+        limit_offset_prob = max(limit_offset_prob, 0.14)
+
+    return random.random() < limit_offset_prob
+
+
 def _choose_orderby_keys(
-    project_fields: List[str],
+    project_fields: List[object],
     ctx: GenContext,
     stress_mode: str = "balanced",
     template: Optional[Dict[str, object]] = None,
@@ -1186,11 +1411,23 @@ def _choose_orderby_keys(
     if not should_orderby:
         return []
 
-    unique_fields = _dedupe_keep_order(project_fields)
+    order_exprs = [_projection_order_expr(field) for field in project_fields]
+    unique_fields = []
+    seen_exprs = set()
+    for expr in order_exprs:
+        key = repr(expr)
+        if key in seen_exprs:
+            continue
+        seen_exprs.add(key)
+        unique_fields.append(expr)
     ordered_fields: List[str] = []
 
     if template and template.get("prefer_orderby_agg"):
-        agg_fields = [field for field in unique_fields if field in ctx.agg_aliases]
+        agg_fields = [
+            field
+            for field in unique_fields
+            if isinstance(field, str) and field in ctx.agg_aliases
+        ]
         other_fields = [field for field in unique_fields if field not in agg_fields]
         ordered_fields.extend(agg_fields)
         ordered_fields.extend(other_fields)
@@ -1198,7 +1435,7 @@ def _choose_orderby_keys(
         right_fields = [
             field
             for field in unique_fields
-            if "." in field and field.split(".", 1)[0] in ctx.left_join_right_aliases
+            if isinstance(field, str) and "." in field and field.split(".", 1)[0] in ctx.left_join_right_aliases
         ]
         other_fields = [field for field in unique_fields if field not in right_fields]
         ordered_fields.extend(right_fields)

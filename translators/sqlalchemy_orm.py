@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sqlalchemy import MetaData, and_, func, not_, or_, select
+from sqlalchemy import MetaData, and_, case, func, literal, not_, or_, select
 from sqlalchemy.engine import Engine
 
 from db.connector import get_engine
@@ -18,6 +18,10 @@ from ir.nodes import (
     AggFunc,
     Aggregate,
     And,
+    ArithExpr,
+    ArithOp,
+    Between,
+    CaseWhen,
     CmpOp,
     Compare,
     Condition,
@@ -25,8 +29,11 @@ from ir.nodes import (
     Filter,
     GroupBy,
     Having,
+    InList,
     Join,
     JoinType,
+    Like,
+    LimitOffset,
     Not,
     Or,
     OrderBy,
@@ -34,6 +41,7 @@ from ir.nodes import (
     Project,
     QueryNode,
     Scan,
+    SelectItem,
 )
 
 Row = Dict[str, Any]
@@ -101,6 +109,8 @@ def _collect_ctx(node: QueryNode, engine: Engine) -> dict:
         return _build_distinct_ctx(node, engine)
     if isinstance(node, OrderBy):
         return _build_orderby_ctx(node, engine)
+    if isinstance(node, LimitOffset):
+        return _build_limit_offset_ctx(node, engine)
     raise NotImplementedError(f"unknown node type: {type(node)}")
 
 
@@ -115,6 +125,8 @@ def _base_ctx() -> dict:
         "select_cols": [],
         "distinct": False,
         "orderby": [],
+        "limit": None,
+        "offset": None,
     }
 
 
@@ -146,6 +158,8 @@ def _build_join_ctx(node: Join, engine: Engine) -> dict:
     ctx["select_cols"] = list(left_ctx["select_cols"]) + list(right_ctx["select_cols"])
     ctx["distinct"] = left_ctx["distinct"] or right_ctx["distinct"]
     ctx["orderby"] = left_ctx["orderby"] + right_ctx["orderby"]
+    ctx["limit"] = left_ctx["limit"] if left_ctx["limit"] is not None else right_ctx["limit"]
+    ctx["offset"] = left_ctx["offset"] if left_ctx["offset"] is not None else right_ctx["offset"]
 
     left_from = left_ctx["froms"][0]
     right_from = right_ctx["froms"][0]
@@ -161,7 +175,7 @@ def _build_join_ctx(node: Join, engine: Engine) -> dict:
 
 def _build_groupby_ctx(node: GroupBy, engine: Engine) -> dict:
     ctx = _collect_ctx(node.child, engine)
-    groupby_cols = [_resolve_col(field, ctx) for field in node.fields]
+    groupby_cols = [_resolve_expr(field, ctx, prefer_field=True) for field in node.fields]
     ctx["groupby"] = groupby_cols
 
     agg_exprs = []
@@ -184,11 +198,12 @@ def _build_project_ctx(node: Project, engine: Engine) -> dict:
     ctx = _collect_ctx(node.child, engine)
     cols = []
     for field in node.fields:
-        if field in ctx["agg_map"]:
+        if isinstance(field, SelectItem):
+            cols.append(_resolve_expr(field.expr, ctx, prefer_field=True).label(field.alias))
+        elif field in ctx["agg_map"]:
             cols.append(ctx["agg_map"][field])
         else:
-            col = _resolve_col(field, ctx)
-            cols.append(col.label(field.replace(".", "_")))
+            cols.append(_resolve_expr(field, ctx, prefer_field=True).label(str(field).replace(".", "_")))
     ctx["select_cols"] = cols
     return ctx
 
@@ -202,6 +217,13 @@ def _build_distinct_ctx(node: Distinct, engine: Engine) -> dict:
 def _build_orderby_ctx(node: OrderBy, engine: Engine) -> dict:
     ctx = _collect_ctx(node.child, engine)
     ctx["orderby"] = [_build_order_key(key, ctx) for key in node.keys]
+    return ctx
+
+
+def _build_limit_offset_ctx(node: LimitOffset, engine: Engine) -> dict:
+    ctx = _collect_ctx(node.child, engine)
+    ctx["limit"] = max(0, node.limit)
+    ctx["offset"] = max(0, node.offset)
     return ctx
 
 
@@ -226,19 +248,19 @@ def _assemble(ctx: dict):
         stmt = stmt.having(and_(*ctx["having"]))
     if ctx["orderby"]:
         stmt = stmt.order_by(*ctx["orderby"])
+    if ctx["limit"] is not None:
+        stmt = stmt.limit(ctx["limit"])
+    if ctx["offset"]:
+        stmt = stmt.offset(ctx["offset"])
     return stmt
 
 
 def _build_condition(cond: Condition, ctx: dict):
     if isinstance(cond, Compare):
-        left_col = _resolve_col(cond.field, ctx)
-        right = (
-            _resolve_col(cond.value, ctx)
-            if isinstance(cond.value, str) and "." in cond.value
-            else cond.value
-        )
+        left_col = _resolve_expr(cond.field, ctx, prefer_field=True)
+        right = _resolve_expr(cond.value, ctx, prefer_field=True)
 
-        if right is None:
+        if cond.value is None:
             if cond.op == CmpOp.EQ:
                 return left_col.is_(None)
             if cond.op == CmpOp.NEQ:
@@ -258,6 +280,23 @@ def _build_condition(cond: Condition, ctx: dict):
             return left_col <= right
         raise NotImplementedError(f"unknown compare op: {cond.op}")
 
+    if isinstance(cond, InList):
+        left_col = _resolve_expr(cond.field, ctx, prefer_field=True)
+        values = [_resolve_expr(value, ctx, prefer_field=True) for value in cond.values]
+        return left_col.not_in(values) if cond.negated else left_col.in_(values)
+
+    if isinstance(cond, Between):
+        left_col = _resolve_expr(cond.field, ctx, prefer_field=True)
+        lower = _resolve_expr(cond.lower, ctx, prefer_field=True)
+        upper = _resolve_expr(cond.upper, ctx, prefer_field=True)
+        expr = left_col.between(lower, upper)
+        return not_(expr) if cond.negated else expr
+
+    if isinstance(cond, Like):
+        left_col = _resolve_expr(cond.field, ctx, prefer_field=True)
+        expr = left_col.like(cond.pattern)
+        return not_(expr) if cond.negated else expr
+
     if isinstance(cond, And):
         return and_(_build_condition(cond.left, ctx), _build_condition(cond.right, ctx))
     if isinstance(cond, Or):
@@ -269,9 +308,9 @@ def _build_condition(cond: Condition, ctx: dict):
 
 def _build_aggregate(agg: Aggregate, ctx: dict):
     if agg.func == AggFunc.COUNT:
-        return func.count() if agg.field == "*" else func.count(_resolve_col(agg.field, ctx))
+        return func.count() if agg.field == "*" else func.count(_resolve_expr(agg.field, ctx, prefer_field=True))
 
-    col = _resolve_col(agg.field, ctx)
+    col = _resolve_expr(agg.field, ctx, prefer_field=True)
     fn_map = {
         AggFunc.SUM: func.sum,
         AggFunc.AVG: func.avg,
@@ -282,14 +321,50 @@ def _build_aggregate(agg: Aggregate, ctx: dict):
 
 
 def _build_order_key(key: OrderKey, ctx: dict):
-    expr = _resolve_col(key.field, ctx)
+    expr = _resolve_expr(key.field, ctx, prefer_field=True)
     return expr.desc() if key.descending else expr.asc()
 
 
-def _resolve_col(field_name: str, ctx: dict):
-    if field_name in ctx.get("agg_map", {}):
-        return ctx["agg_map"][field_name]
+def _resolve_expr(expr, ctx: dict, prefer_field: bool = False):
+    if isinstance(expr, ArithExpr):
+        left = _resolve_expr(expr.left, ctx, prefer_field=True)
+        right = _resolve_expr(expr.right, ctx, prefer_field=True)
+        if expr.op == ArithOp.ADD:
+            return left + right
+        if expr.op == ArithOp.SUB:
+            return left - right
+        if expr.op == ArithOp.MUL:
+            return left * right
+        if expr.op == ArithOp.DIV:
+            return left / right
+        if expr.op == ArithOp.MOD:
+            return left % right
+        raise NotImplementedError(f"unknown arithmetic op: {expr.op}")
 
+    if isinstance(expr, CaseWhen):
+        whens = []
+        for case_item in expr.cases:
+            whens.append(
+                (
+                    _build_condition(case_item.condition, ctx),
+                    _resolve_expr(case_item.value, ctx, prefer_field=True),
+                )
+            )
+        return case(*whens, else_=_resolve_expr(expr.else_value, ctx, prefer_field=False))
+
+    if isinstance(expr, str):
+        if expr in ctx.get("agg_map", {}):
+            return ctx["agg_map"][expr]
+        if prefer_field:
+            resolved = _maybe_resolve_col(expr, ctx)
+            if resolved is not None:
+                return resolved
+        return literal(expr)
+
+    return literal(expr)
+
+
+def _maybe_resolve_col(field_name: str, ctx: dict):
     if "." in field_name:
         table_alias, col_name = field_name.split(".", 1)
         table = ctx["tables"].get(table_alias)
@@ -313,7 +388,4 @@ def _resolve_col(field_name: str, ctx: dict):
             "use the first matched column"
         )
         return matches[0]
-    raise KeyError(
-        f"[sqlalchemy_orm] field '{field_name}' not found, "
-        f"known aliases: {list(ctx['tables'].keys()) + list(ctx.get('agg_map', {}).keys())}"
-    )
+    return None

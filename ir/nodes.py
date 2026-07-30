@@ -34,11 +34,48 @@ class JoinType(Enum):
     LEFT = "LEFT"
 
 
+class ArithOp(Enum):
+    ADD = "+"
+    SUB = "-"
+    MUL = "*"
+    DIV = "/"
+    MOD = "%"
+
+
+@dataclass
+class ArithExpr:
+    left: "ValueExpr"
+    op: ArithOp
+    right: "ValueExpr"
+
+
 @dataclass
 class Compare:
-    field: str
+    field: "ValueExpr"
     op: CmpOp
-    value: Union[int, float, str, None]
+    value: "ValueExpr"
+
+
+@dataclass
+class InList:
+    field: "ValueExpr"
+    values: List["ValueExpr"]
+    negated: bool = False
+
+
+@dataclass
+class Between:
+    field: "ValueExpr"
+    lower: "ValueExpr"
+    upper: "ValueExpr"
+    negated: bool = False
+
+
+@dataclass
+class Like:
+    field: "ValueExpr"
+    pattern: str
+    negated: bool = False
 
 
 @dataclass
@@ -58,19 +95,38 @@ class Not:
     child: "Condition"
 
 
-Condition = Union[Compare, And, Or, Not]
+@dataclass
+class WhenClause:
+    condition: "Condition"
+    value: "ValueExpr"
+
+
+@dataclass
+class CaseWhen:
+    cases: List[WhenClause]
+    else_value: "ValueExpr"
+
+
+ValueExpr = Union[str, int, float, None, ArithExpr, CaseWhen]
+Condition = Union[Compare, InList, Between, Like, And, Or, Not]
 
 
 @dataclass
 class Aggregate:
     func: AggFunc
-    field: str
+    field: Union[str, ValueExpr]
+    alias: str
+
+
+@dataclass
+class SelectItem:
+    expr: ValueExpr
     alias: str
 
 
 @dataclass
 class OrderKey:
-    field: str
+    field: Union[str, ValueExpr]
     descending: bool = False
 
 
@@ -100,7 +156,7 @@ class Join:
 
 @dataclass
 class GroupBy:
-    fields: List[str]
+    fields: List[Union[str, ValueExpr]]
     aggregates: List[Aggregate]
     child: "QueryNode"
 
@@ -113,7 +169,7 @@ class Having:
 
 @dataclass
 class Project:
-    fields: List[str]
+    fields: List[Union[str, SelectItem]]
     child: "QueryNode"
 
 
@@ -128,7 +184,14 @@ class OrderBy:
     child: "QueryNode"
 
 
-QueryNode = Union[Scan, Filter, Join, GroupBy, Having, Project, Distinct, OrderBy]
+@dataclass
+class LimitOffset:
+    limit: int
+    offset: int = 0
+    child: "QueryNode" = None
+
+
+QueryNode = Union[Scan, Filter, Join, GroupBy, Having, Project, Distinct, OrderBy, LimitOffset]
 
 
 def pretty_print(node, indent: int = 0) -> str:
@@ -154,12 +217,13 @@ def pretty_print(node, indent: int = 0) -> str:
 
     if isinstance(node, GroupBy):
         aggs = [
-            f"Aggregate({agg.func.value}, {agg.field!r}, alias={agg.alias!r})"
+            f"Aggregate({agg.func.value}, {_fmt_expr(agg.field)}, alias={agg.alias!r})"
             for agg in node.aggregates
         ]
+        fields = [_fmt_expr(field) for field in node.fields]
         child_str = pretty_print(node.child, indent + 1)
         return (
-            f"{pad}GroupBy(\n{pad}  fields={node.fields},\n"
+            f"{pad}GroupBy(\n{pad}  fields={fields},\n"
             f"{pad}  aggregates={aggs},\n"
             f"{pad}  child=\n{child_str}\n{pad})"
         )
@@ -170,8 +234,9 @@ def pretty_print(node, indent: int = 0) -> str:
         return f"{pad}Having(\n{pad}  condition={cond},\n{pad}  child=\n{child_str}\n{pad})"
 
     if isinstance(node, Project):
+        fields = [_fmt_project_field(field) for field in node.fields]
         child_str = pretty_print(node.child, indent + 1)
-        return f"{pad}Project(\n{pad}  fields={node.fields},\n{pad}  child=\n{child_str}\n{pad})"
+        return f"{pad}Project(\n{pad}  fields={fields},\n{pad}  child=\n{child_str}\n{pad})"
 
     if isinstance(node, Distinct):
         child_str = pretty_print(node.child, indent + 1)
@@ -179,18 +244,56 @@ def pretty_print(node, indent: int = 0) -> str:
 
     if isinstance(node, OrderBy):
         keys = [
-            f"OrderKey({key.field!r}, descending={key.descending})"
+            f"OrderKey({_fmt_expr(key.field)}, descending={key.descending})"
             for key in node.keys
         ]
         child_str = pretty_print(node.child, indent + 1)
         return f"{pad}OrderBy(\n{pad}  keys={keys},\n{pad}  child=\n{child_str}\n{pad})"
 
+    if isinstance(node, LimitOffset):
+        child_str = pretty_print(node.child, indent + 1)
+        return (
+            f"{pad}LimitOffset(\n{pad}  limit={node.limit},\n{pad}  offset={node.offset},\n"
+            f"{pad}  child=\n{child_str}\n{pad})"
+        )
+
     return f"{pad}{repr(node)}"
+
+
+def _fmt_project_field(field) -> str:
+    if isinstance(field, SelectItem):
+        return f"SelectItem(expr={_fmt_expr(field.expr)}, alias={field.alias!r})"
+    return _fmt_expr(field)
+
+
+def _fmt_expr(expr) -> str:
+    if isinstance(expr, ArithExpr):
+        return f"ArithExpr({_fmt_expr(expr.left)} {expr.op.value} {_fmt_expr(expr.right)})"
+    if isinstance(expr, CaseWhen):
+        cases = [
+            f"WhenClause(condition={_fmt_condition(case.condition)}, value={_fmt_expr(case.value)})"
+            for case in expr.cases
+        ]
+        return f"CaseWhen(cases={cases}, else_value={_fmt_expr(expr.else_value)})"
+    return repr(expr)
 
 
 def _fmt_condition(cond) -> str:
     if isinstance(cond, Compare):
-        return f"Compare({cond.field!r} {cond.op.value} {cond.value!r})"
+        return f"Compare({_fmt_expr(cond.field)} {cond.op.value} {_fmt_expr(cond.value)})"
+    if isinstance(cond, InList):
+        values = [_fmt_expr(value) for value in cond.values]
+        prefix = "NOT " if cond.negated else ""
+        return f"{prefix}InList(field={_fmt_expr(cond.field)}, values={values})"
+    if isinstance(cond, Between):
+        prefix = "NOT " if cond.negated else ""
+        return (
+            f"{prefix}Between(field={_fmt_expr(cond.field)}, "
+            f"lower={_fmt_expr(cond.lower)}, upper={_fmt_expr(cond.upper)})"
+        )
+    if isinstance(cond, Like):
+        prefix = "NOT " if cond.negated else ""
+        return f"{prefix}Like(field={_fmt_expr(cond.field)}, pattern={cond.pattern!r})"
     if isinstance(cond, And):
         return f"And({_fmt_condition(cond.left)}, {_fmt_condition(cond.right)})"
     if isinstance(cond, Or):

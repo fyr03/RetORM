@@ -73,7 +73,10 @@ def execute_sql(sql: str, params=None) -> List[Dict[str, Any]]:
     conn = get_connection()
     try:
         with conn.cursor() as cursor:
-            cursor.execute(sql, params or ())
+            if params is None:
+                cursor.execute(sql)
+            else:
+                cursor.execute(sql, params)
             # DictCursor 对非 SELECT 语句 fetchall() 返回空列表
             result = cursor.fetchall()
             return list(result)
