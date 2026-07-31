@@ -24,10 +24,12 @@ from ir.nodes import (
     Compare,
     Condition,
     Distinct,
+    Exists,
     Filter,
     GroupBy,
     Having,
     InList,
+    InSubquery,
     Join,
     JoinType,
     Like,
@@ -202,6 +204,15 @@ def _translate_condition(cond: Condition, agg_expr_map: Optional[dict] = None) -
         not_prefix = "NOT " if cond.negated else ""
         return f"{left} {not_prefix}LIKE {_quote_value(cond.pattern)}"
 
+    if isinstance(cond, Exists):
+        not_prefix = "NOT " if cond.negated else ""
+        return f"{not_prefix}EXISTS ({_translate_subquery(cond.subquery)})"
+
+    if isinstance(cond, InSubquery):
+        left = _translate_expr(cond.field, agg_expr_map=agg_expr_map, prefer_field=True)
+        not_prefix = "NOT " if cond.negated else ""
+        return f"{left} {not_prefix}IN ({_translate_in_subquery(cond.subquery)})"
+
     if isinstance(cond, And):
         return (
             f"({_translate_condition(cond.left, agg_expr_map)}) AND "
@@ -290,6 +301,32 @@ def _collect_aggregates(node: QueryNode) -> dict:
         result.update(_collect_aggregates(node.left))
         result.update(_collect_aggregates(node.right))
     return result
+
+
+def _translate_subquery(node: QueryNode) -> str:
+    return translate(node).rstrip(";")
+
+
+def _translate_in_subquery(node: QueryNode) -> str:
+    """
+    MySQL rejects LIMIT directly inside IN/ALL/ANY/SOME subqueries.
+    Wrap such subqueries in a derived table so the LIMIT stays in the inner
+    SELECT while the IN operand becomes a plain one-column query.
+    """
+    subquery_sql = _translate_subquery(node)
+    if _query_has_limit_offset(node):
+        return f"SELECT * FROM ({subquery_sql}) AS `retorm_in_subq`"
+    return subquery_sql
+
+
+def _query_has_limit_offset(node: QueryNode) -> bool:
+    if isinstance(node, LimitOffset):
+        return True
+    if isinstance(node, (Filter, GroupBy, Having, Project, Distinct, OrderBy)):
+        return _query_has_limit_offset(node.child)
+    if isinstance(node, Join):
+        return _query_has_limit_offset(node.left) or _query_has_limit_offset(node.right)
+    return False
 
 
 def _quote_field(field_name: str) -> str:

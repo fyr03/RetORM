@@ -47,10 +47,12 @@ from ir.nodes import (
     Compare,
     CmpOp,
     Distinct,
+    Exists,
     Filter,
     GroupBy,
     Having,
     InList,
+    InSubquery,
     Join,
     JoinType,
     Like,
@@ -362,6 +364,39 @@ def test_sql_translate_supports_limit_offset_and_extended_predicates():
     assert "CASE WHEN" in sql
 
 
+def test_sql_translate_supports_exists_and_in_subquery():
+    subquery = Project(
+        fields=["u.id"],
+        child=Filter(
+            condition=Compare("u.score", CmpOp.GTE, 10),
+            child=Scan("users", "u"),
+        ),
+    )
+    ir = Project(
+        fields=["o.id"],
+        child=Filter(
+            condition=And(
+                InSubquery("o.user_id", subquery),
+                Exists(
+                    Project(
+                        fields=["p.id"],
+                        child=Filter(
+                            condition=Compare("p.order_id", CmpOp.EQ, 1),
+                            child=Scan("payments", "p"),
+                        ),
+                    )
+                ),
+            ),
+            child=Scan("orders", "o"),
+        ),
+    )
+
+    sql = translate(ir)
+    assert "EXISTS (" in sql
+    assert "IN (" in sql
+    assert "SELECT `u`.`id`" in sql
+
+
 def test_sql_translate_case_when_over_aggregate_alias_uses_plain_aggregate_expr():
     ir = Project(
         fields=[
@@ -513,6 +548,23 @@ def test_python_ref_extended_predicates_and_limit_offset():
     assert rows == [{"o.id": 2}, {"o.id": 3}]
 
 
+def test_python_ref_supports_exists_and_in_subquery():
+    row = {"o.user_id": 2}
+    subquery = Project(fields=["u.id"], child=Scan("users", "u"))
+    exists_query = Project(fields=["p.id"], child=Scan("payments", "p"))
+
+    def fake_eval(node):
+        if node is subquery:
+            return [{"u.id": 1}, {"u.id": 2}]
+        if node is exists_query:
+            return [{"p.id": 9}]
+        raise AssertionError(f"unexpected subquery node: {node}")
+
+    with patch("translators.python_ref._eval", side_effect=fake_eval):
+        assert _eval_condition_3vl(InSubquery("o.user_id", subquery), row) is True
+        assert _eval_condition_3vl(Exists(exists_query), row) is True
+
+
 def test_data_gen_null_heavy_raises_null_probability():
     nullable_int = Column(name="score", col_type=ColType.INT, nullable=True)
 
@@ -656,6 +708,82 @@ def test_ir_generator_distinct_heavy_emits_distinct():
     assert _collect_query_features(ir)["has_distinct"] is True
 
 
+def test_ir_generator_subquery_heavy_emits_subquery():
+    schema = types.SimpleNamespace(
+        tables=[
+            TableSchema(
+                name="users",
+                columns=[
+                    Column(name="id", col_type=ColType.INT, nullable=False, is_pk=True),
+                    Column(name="score", col_type=ColType.INT, nullable=True),
+                ],
+            ),
+            TableSchema(
+                name="orders",
+                columns=[
+                    Column(name="id", col_type=ColType.INT, nullable=False, is_pk=True),
+                    Column(name="user_id", col_type=ColType.INT, nullable=False),
+                    Column(name="amount", col_type=ColType.FLOAT, nullable=True),
+                ],
+                fks=[types.SimpleNamespace(src_table="orders", src_col="user_id", ref_table="users", ref_col="id")],
+            ),
+        ],
+        fk_pairs=lambda: list(schema.tables[1].fks),
+        get_table=lambda name: schema.tables[0] if name == "users" else schema.tables[1],
+    )
+
+    ir, _ = generate_ir(schema, stress_mode="subquery_heavy", seed=17)
+    assert _collect_query_features(ir)["has_subquery"] is True
+
+
+def test_ir_generator_combo_heavy_emits_combo_features():
+    schema = types.SimpleNamespace(
+        tables=[
+            TableSchema(
+                name="users",
+                columns=[
+                    Column(name="id", col_type=ColType.INT, nullable=False, is_pk=True),
+                    Column(name="score", col_type=ColType.INT, nullable=True),
+                ],
+            ),
+            TableSchema(
+                name="orders",
+                columns=[
+                    Column(name="id", col_type=ColType.INT, nullable=False, is_pk=True),
+                    Column(name="user_id", col_type=ColType.INT, nullable=False),
+                    Column(name="amount", col_type=ColType.FLOAT, nullable=True),
+                ],
+                fks=[types.SimpleNamespace(src_table="orders", src_col="user_id", ref_table="users", ref_col="id")],
+            ),
+            TableSchema(
+                name="payments",
+                columns=[
+                    Column(name="id", col_type=ColType.INT, nullable=False, is_pk=True),
+                    Column(name="order_id", col_type=ColType.INT, nullable=False),
+                    Column(name="total", col_type=ColType.FLOAT, nullable=True),
+                ],
+                fks=[types.SimpleNamespace(src_table="payments", src_col="order_id", ref_table="orders", ref_col="id")],
+            ),
+            TableSchema(
+                name="items",
+                columns=[
+                    Column(name="id", col_type=ColType.INT, nullable=False, is_pk=True),
+                    Column(name="payments_id", col_type=ColType.INT, nullable=False),
+                    Column(name="score", col_type=ColType.FLOAT, nullable=True),
+                ],
+                fks=[types.SimpleNamespace(src_table="items", src_col="payments_id", ref_table="payments", ref_col="id")],
+            ),
+        ],
+        fk_pairs=lambda: list(schema.tables[1].fks) + list(schema.tables[2].fks) + list(schema.tables[3].fks),
+        get_table=lambda name: next(t for t in schema.tables if t.name == name),
+    )
+
+    ir, _ = generate_ir(schema, stress_mode="combo_heavy", seed=21)
+    features = _collect_query_features(ir)
+    assert features["has_subquery"] is True
+    assert features["has_groupby"] is True
+
+
 def test_ir_generator_null_heavy_can_force_left_join_and_null_predicate():
     left = TableSchema(
         name="users",
@@ -745,6 +873,24 @@ def test_runner_collects_extended_syntax_features():
     assert features["has_case_when"] is True
 
 
+def test_runner_collects_subquery_features():
+    ir = Filter(
+        condition=And(
+            InSubquery(
+                "o.user_id",
+                Project(fields=["u.id"], child=Scan("users", "u")),
+            ),
+            Exists(Project(fields=["p.id"], child=Scan("payments", "p"))),
+        ),
+        child=Scan("orders", "o"),
+    )
+
+    features = _collect_query_features(ir)
+    assert features["has_subquery"] is True
+    assert features["has_exists_subquery"] is True
+    assert features["has_in_subquery"] is True
+
+
 def test_connector_execute_sql_without_params_does_not_pass_empty_args():
     connector_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -754,7 +900,27 @@ def test_connector_execute_sql_without_params_does_not_pass_empty_args():
     spec = importlib.util.spec_from_file_location("retorm_db_connector_real", connector_path)
     connector_mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
-    spec.loader.exec_module(connector_mod)
+    pymysql_stub = types.ModuleType("pymysql")
+    pymysql_stub.cursors = types.SimpleNamespace(DictCursor=object)
+    pymysql_stub.connections = types.SimpleNamespace(Connection=object)
+    pymysql_cursors_stub = types.ModuleType("pymysql.cursors")
+    pymysql_cursors_stub.DictCursor = object
+    sqlalchemy_stub = types.ModuleType("sqlalchemy")
+    sqlalchemy_stub.create_engine = lambda *args, **kwargs: None
+    sqlalchemy_stub.text = lambda sql: sql
+    sqlalchemy_engine_stub = types.ModuleType("sqlalchemy.engine")
+    sqlalchemy_engine_stub.Engine = object
+
+    with patch.dict(
+        sys.modules,
+        {
+            "pymysql": pymysql_stub,
+            "pymysql.cursors": pymysql_cursors_stub,
+            "sqlalchemy": sqlalchemy_stub,
+            "sqlalchemy.engine": sqlalchemy_engine_stub,
+        },
+    ):
+        spec.loader.exec_module(connector_mod)
 
     calls = []
 
@@ -942,6 +1108,8 @@ def test_runner_stress_mode_boosts_duplicate_when_coverage_low():
         "null_heavy",
         "orderby_heavy",
         "distinct_heavy",
+        "subquery_heavy",
+        "combo_heavy",
     }
 
 
@@ -964,12 +1132,15 @@ if __name__ == "__main__":
     test_sql_translate_supports_nested_join_chain()
     test_sql_translate_supports_distinct_and_orderby()
     test_sql_translate_supports_limit_offset_and_extended_predicates()
+    test_sql_translate_supports_exists_and_in_subquery()
+    test_sql_translate_case_when_over_aggregate_alias_uses_plain_aggregate_expr()
     test_python_ref_null_compare_matches_is_null_semantics()
     test_python_ref_left_join_null_extends_unmatched_rows()
     test_python_ref_distinct_removes_duplicate_rows()
     test_python_ref_orderby_applies_mixed_direction_keys()
     test_python_ref_project_supports_case_when_and_arithmetic()
     test_python_ref_extended_predicates_and_limit_offset()
+    test_python_ref_supports_exists_and_in_subquery()
     test_data_gen_null_heavy_raises_null_probability()
     test_data_gen_row_budget_adds_edge_and_adversarial_rows()
     test_ir_generator_groupby_sampling_respects_preferred_pool_size()
@@ -977,8 +1148,13 @@ if __name__ == "__main__":
     test_ir_generator_groupby_heavy_enforces_groupby_and_having()
     test_ir_generator_orderby_heavy_emits_orderby()
     test_ir_generator_distinct_heavy_emits_distinct()
+    test_ir_generator_subquery_heavy_emits_subquery()
+    test_ir_generator_combo_heavy_emits_combo_features()
     test_ir_generator_null_heavy_can_force_left_join_and_null_predicate()
     test_runner_collects_distinct_and_orderby_features()
+    test_runner_collects_extended_syntax_features()
+    test_runner_collects_subquery_features()
+    test_connector_execute_sql_without_params_does_not_pass_empty_args()
     test_runner_skips_all_matched_bug_reports()
     test_runner_keeps_real_mismatches_and_errors()
     test_runner_classifies_sql_mismatch_without_compare_result_truthiness()

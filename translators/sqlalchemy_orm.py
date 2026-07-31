@@ -26,10 +26,12 @@ from ir.nodes import (
     Compare,
     Condition,
     Distinct,
+    Exists,
     Filter,
     GroupBy,
     Having,
     InList,
+    InSubquery,
     Join,
     JoinType,
     Like,
@@ -127,12 +129,14 @@ def _base_ctx() -> dict:
         "orderby": [],
         "limit": None,
         "offset": None,
+        "engine": None,
     }
 
 
 def _build_scan_ctx(node: Scan, engine: Engine) -> dict:
     table_alias = _get_table(node.table, engine).alias(node.alias)
     ctx = _base_ctx()
+    ctx["engine"] = engine
     ctx["froms"] = [table_alias]
     ctx["tables"] = {node.alias: table_alias}
     ctx["select_cols"] = [table_alias]
@@ -150,6 +154,7 @@ def _build_join_ctx(node: Join, engine: Engine) -> dict:
     right_ctx = _collect_ctx(node.right, engine)
 
     ctx = _base_ctx()
+    ctx["engine"] = engine
     ctx["tables"] = {**left_ctx["tables"], **right_ctx["tables"]}
     ctx["where"] = left_ctx["where"] + right_ctx["where"]
     ctx["groupby"] = left_ctx["groupby"] + right_ctx["groupby"]
@@ -227,15 +232,25 @@ def _build_limit_offset_ctx(node: LimitOffset, engine: Engine) -> dict:
     return ctx
 
 
-def _assemble(ctx: dict):
+def _assemble(ctx: dict, select_override=None):
+    expanded = list(select_override) if select_override is not None else _expand_select_cols(ctx)
+    stmt = select(*expanded)
+    return _apply_stmt_clauses(stmt, ctx)
+
+
+def _expand_select_cols(ctx: dict):
     expanded = []
     for item in ctx["select_cols"]:
         if hasattr(item, "c"):
             expanded.extend(item.c)
         else:
             expanded.append(item)
+    if not expanded:
+        expanded.append(literal(1))
+    return expanded
 
-    stmt = select(*expanded)
+
+def _apply_stmt_clauses(stmt, ctx: dict):
     if ctx["distinct"]:
         stmt = stmt.distinct()
     for from_clause in ctx["froms"]:
@@ -295,6 +310,29 @@ def _build_condition(cond: Condition, ctx: dict):
     if isinstance(cond, Like):
         left_col = _resolve_expr(cond.field, ctx, prefer_field=True)
         expr = left_col.like(cond.pattern)
+        return not_(expr) if cond.negated else expr
+
+    if isinstance(cond, Exists):
+        sub_ctx = _collect_ctx(cond.subquery, ctx["engine"])
+        expr = _assemble(sub_ctx, select_override=[literal(1)]).exists()
+        return not_(expr) if cond.negated else expr
+
+    if isinstance(cond, InSubquery):
+        left_col = _resolve_expr(cond.field, ctx, prefer_field=True)
+        sub_ctx = _collect_ctx(cond.subquery, ctx["engine"])
+        sub_stmt = _assemble(sub_ctx)
+        if _query_has_limit_offset(cond.subquery):
+            subq = sub_stmt.subquery("retorm_in_subq")
+            sub_cols = list(subq.c)
+            if len(sub_cols) != 1:
+                raise ValueError(
+                    "[sqlalchemy_orm] IN subquery with LIMIT/OFFSET must return exactly one column"
+                )
+            sub_stmt = select(sub_cols[0])
+        else:
+            sub_cols = _expand_select_cols(sub_ctx)
+            sub_stmt = select(sub_cols[0])
+        expr = left_col.in_(sub_stmt)
         return not_(expr) if cond.negated else expr
 
     if isinstance(cond, And):
@@ -389,3 +427,13 @@ def _maybe_resolve_col(field_name: str, ctx: dict):
         )
         return matches[0]
     return None
+
+
+def _query_has_limit_offset(node: QueryNode) -> bool:
+    if isinstance(node, LimitOffset):
+        return True
+    if isinstance(node, (Filter, GroupBy, Having, Project, Distinct, OrderBy)):
+        return _query_has_limit_offset(node.child)
+    if isinstance(node, Join):
+        return _query_has_limit_offset(node.left) or _query_has_limit_offset(node.right)
+    return False

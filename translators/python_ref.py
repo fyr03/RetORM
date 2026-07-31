@@ -25,10 +25,12 @@ from ir.nodes import (
     Compare,
     Condition,
     Distinct,
+    Exists,
     Filter,
     GroupBy,
     Having,
     InList,
+    InSubquery,
     Join,
     JoinType,
     Like,
@@ -269,6 +271,22 @@ def _eval_condition_3vl(cond: Condition, row: Row):
         result = _like_match(value, cond.pattern)
         return (not result) if cond.negated else result
 
+    if isinstance(cond, Exists):
+        result = bool(_eval(cond.subquery))
+        return (not result) if cond.negated else result
+
+    if isinstance(cond, InSubquery):
+        left_val = _eval_expr(cond.field, row, prefer_field=True)
+        if left_val is None:
+            return None
+        sub_rows = _eval(cond.subquery)
+        values = _extract_subquery_values(sub_rows)
+        non_null_values = [value for value in values if value is not None]
+        result = left_val in non_null_values
+        if not result and any(value is None for value in values):
+            return None
+        return (not result) if cond.negated else result
+
     if isinstance(cond, And):
         left = _eval_condition_3vl(cond.left, row)
         right = _eval_condition_3vl(cond.right, row)
@@ -375,6 +393,17 @@ def _translate_like_char(ch: str) -> str:
 
 def _expr_is_literal_none(expr) -> bool:
     return expr is None
+
+
+def _extract_subquery_values(rows: Rows) -> List[Any]:
+    values: List[Any] = []
+    for row in rows:
+        if not row:
+            values.append(None)
+            continue
+        first_key = next(iter(row))
+        values.append(row[first_key])
+    return values
 
 
 _UNRESOLVED = object()

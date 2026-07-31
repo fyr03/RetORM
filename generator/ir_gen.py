@@ -30,10 +30,12 @@ from ir.nodes import (
     Compare,
     Condition,
     Distinct,
+    Exists,
     Filter,
     GroupBy,
     Having,
     InList,
+    InSubquery,
     Join,
     JoinType,
     Like,
@@ -197,6 +199,16 @@ def _generate_ir_once(
         if cond is not None:
             node = Filter(condition=cond, child=node)
 
+    if schema.tables and _should_apply_subquery_condition(stress_mode, template):
+        subquery_cond = _generate_subquery_condition(
+            ctx,
+            schema,
+            stress_mode=stress_mode,
+            template=template,
+        )
+        if subquery_cond is not None:
+            node = _attach_filter_condition(node, subquery_cond)
+
     effective_groupby_prob = min(1.0, groupby_prob + 0.2) if join_step else groupby_prob
     should_groupby = bool(template.get("require_groupby"))
     if not should_groupby:
@@ -277,7 +289,10 @@ def _generate_ir_once(
     if order_keys:
         node = OrderBy(keys=order_keys, child=node)
 
-    if order_keys and _should_apply_limit_offset(stress_mode, template):
+    if order_keys and (
+        template.get("force_distinct_order_limit")
+        or _should_apply_limit_offset(stress_mode, template)
+    ):
         limit = random.randint(1, 5)
         offset = random.randint(0, 3)
         node = LimitOffset(limit=limit, offset=offset, child=node)
@@ -308,6 +323,12 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
         "count_field_prob": 0.18,
         "prefer_nullable_agg_field": False,
         "ref_tables": ref_tables,
+        "require_subquery": False,
+        "prefer_exists_subquery": False,
+        "force_distinct_order_limit": False,
+        "predicate_depth": 2,
+        "max_group_fields": 2,
+        "max_project_fields": 4,
     }
 
     if stress_mode == "join_heavy":
@@ -320,6 +341,7 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
                 "max_aggs": 2,
                 "count_field_prob": 0.25,
                 "require_orderby": True,
+                "predicate_depth": 3,
             }
         )
     elif stress_mode == "groupby_heavy":
@@ -335,6 +357,9 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
                 "prefer_nullable_agg_field": True,
                 "require_orderby": True,
                 "prefer_orderby_agg": True,
+                "predicate_depth": 3,
+                "max_group_fields": 3,
+                "max_project_fields": 5,
             }
         )
     elif stress_mode == "duplicate_column_heavy":
@@ -362,6 +387,7 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
                 "count_field_prob": 0.35,
                 "prefer_nullable_agg_field": True,
                 "require_orderby": True,
+                "predicate_depth": 3,
             }
         )
     elif stress_mode == "orderby_heavy":
@@ -375,6 +401,7 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
                 "min_aggs": 1,
                 "max_aggs": 2,
                 "count_field_prob": 0.4,
+                "predicate_depth": 3,
             }
         )
     elif stress_mode == "distinct_heavy":
@@ -386,6 +413,43 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
                 "prefer_sparse_projection": True,
                 "force_duplicate_projection": can_join,
                 "require_orderby": True,
+            }
+        )
+    elif stress_mode == "subquery_heavy":
+        template.update(
+            {
+                "target_joins": 2 if can_multi_join else (1 if can_join else 0),
+                "require_filter": True,
+                "require_orderby": True,
+                "require_subquery": True,
+                "prefer_exists_subquery": True,
+                "predicate_depth": 3,
+                "min_aggs": 1,
+                "max_aggs": 2,
+                "max_project_fields": 5,
+            }
+        )
+    elif stress_mode == "combo_heavy":
+        template.update(
+            {
+                "target_joins": 3 if len(schema.tables) >= 4 and len(schema.fk_pairs()) >= 3 else (2 if can_multi_join else (1 if can_join else 0)),
+                "require_filter": True,
+                "require_groupby": True,
+                "require_having": True,
+                "require_distinct": True,
+                "require_orderby": True,
+                "require_subquery": True,
+                "force_distinct_order_limit": True,
+                "prefer_exists_subquery": False,
+                "force_left_join": bool(ref_tables),
+                "force_right_projection": can_join,
+                "prefer_orderby_agg": True,
+                "min_aggs": 2,
+                "max_aggs": 3,
+                "count_field_prob": 0.4,
+                "predicate_depth": 4,
+                "max_group_fields": 3,
+                "max_project_fields": 6,
             }
         )
 
@@ -422,7 +486,11 @@ def _ir_satisfies_stress_mode(
         return False
     if template.get("require_orderby") and not features["has_orderby"]:
         return False
+    if template.get("require_subquery") and not features["has_subquery"]:
+        return False
     if template.get("prefer_orderby_agg") and features["has_groupby"] and not features["has_orderby_agg"]:
+        return False
+    if template.get("force_distinct_order_limit") and not features["has_distinct_order_limit"]:
         return False
 
     if stress_mode == "join_heavy":
@@ -439,6 +507,16 @@ def _ir_satisfies_stress_mode(
         return features["has_orderby"]
     if stress_mode == "distinct_heavy":
         return features["has_distinct"]
+    if stress_mode == "subquery_heavy":
+        return features["has_subquery"] and features["has_orderby"]
+    if stress_mode == "combo_heavy":
+        return (
+            features["has_subquery"]
+            and features["has_groupby"]
+            and features["has_having"]
+            and features["has_distinct_order_limit"]
+            and features["join_count"] >= 2
+        )
     return True
 
 
@@ -456,6 +534,10 @@ def _collect_ir_features(node: QueryNode) -> Dict[str, object]:
         "has_orderby": False,
         "has_orderby_agg": False,
         "has_limit_offset": False,
+        "has_subquery": False,
+        "has_exists_subquery": False,
+        "has_in_subquery": False,
+        "has_distinct_order_limit": False,
     }
     left_join_right_aliases = set()
 
@@ -479,6 +561,16 @@ def _collect_ir_features(node: QueryNode) -> Dict[str, object]:
                 features["has_null_predicate"] = True
             return
         if isinstance(cond, (InList, Between, Like)):
+            return
+        if isinstance(cond, Exists):
+            features["has_subquery"] = True
+            features["has_exists_subquery"] = True
+            visit(cond.subquery)
+            return
+        if isinstance(cond, InSubquery):
+            features["has_subquery"] = True
+            features["has_in_subquery"] = True
+            visit(cond.subquery)
             return
         if isinstance(cond, (And, Or)):
             visit_condition(cond.left)
@@ -540,6 +632,9 @@ def _collect_ir_features(node: QueryNode) -> Dict[str, object]:
             visit(cur.child)
 
     visit(node)
+    features["has_distinct_order_limit"] = (
+        features["has_distinct"] and features["has_orderby"] and features["has_limit_offset"]
+    )
     return features
 
 
@@ -554,7 +649,7 @@ def _choose_main_table(
         if candidates:
             return random.choice(candidates)
 
-    if stress_mode in ("join_heavy", "groupby_heavy", "duplicate_column_heavy"):
+    if stress_mode in ("join_heavy", "groupby_heavy", "duplicate_column_heavy", "subquery_heavy", "combo_heavy"):
         scored = []
         for table in schema.tables:
             degree = 0
@@ -796,7 +891,194 @@ def _extra_join_prob(stress_mode: str, join_step: int) -> float:
         base = 0.5
     elif stress_mode == "duplicate_column_heavy":
         base = 0.42
+    elif stress_mode == "subquery_heavy":
+        base = 0.62
+    elif stress_mode == "combo_heavy":
+        base = 0.85
     return max(0.15, base - join_step * 0.1)
+
+
+def _attach_filter_condition(node: QueryNode, cond: Condition) -> QueryNode:
+    if isinstance(node, Filter):
+        merged = And(node.condition, cond) if random.random() < 0.75 else Or(node.condition, cond)
+        return Filter(condition=merged, child=node.child)
+    return Filter(condition=cond, child=node)
+
+
+def _should_apply_subquery_condition(
+    stress_mode: str,
+    template: Optional[Dict[str, object]] = None,
+) -> bool:
+    if template and template.get("require_subquery"):
+        return True
+
+    prob = 0.05
+    if stress_mode == "join_heavy":
+        prob = 0.08
+    elif stress_mode == "groupby_heavy":
+        prob = 0.1
+    elif stress_mode == "orderby_heavy":
+        prob = 0.12
+    elif stress_mode == "subquery_heavy":
+        prob = 0.55
+    elif stress_mode == "combo_heavy":
+        prob = 0.7
+    return random.random() < prob
+
+
+def _generate_subquery_condition(
+    ctx: GenContext,
+    schema: Schema,
+    stress_mode: str = "balanced",
+    template: Optional[Dict[str, object]] = None,
+) -> Optional[Condition]:
+    numeric_fields = [field for field in ctx.visible_cols if _field_is_numeric(ctx, field)]
+    string_fields = [field for field in ctx.visible_cols if not _field_is_numeric(ctx, field)]
+
+    can_in_subquery = bool(numeric_fields or string_fields)
+    prefer_exists = bool(template and template.get("prefer_exists_subquery"))
+
+    if prefer_exists or not can_in_subquery:
+        return _make_exists_subquery(schema, stress_mode=stress_mode, template=template)
+
+    if random.random() < 0.45:
+        return _make_exists_subquery(schema, stress_mode=stress_mode, template=template)
+
+    use_numeric = bool(numeric_fields) and (not string_fields or random.random() < 0.7)
+    target_field = random.choice(numeric_fields if use_numeric else string_fields)
+    target_kind = "numeric" if use_numeric else "string"
+    subquery = _build_subquery_query(
+        schema,
+        target_kind=target_kind,
+        stress_mode=stress_mode,
+        template=template,
+    )
+    if subquery is None:
+        return _make_exists_subquery(schema, stress_mode=stress_mode, template=template)
+    return InSubquery(field=target_field, subquery=subquery, negated=(random.random() < 0.2))
+
+
+def _make_exists_subquery(
+    schema: Schema,
+    stress_mode: str = "balanced",
+    template: Optional[Dict[str, object]] = None,
+) -> Optional[Condition]:
+    subquery = _build_subquery_query(
+        schema,
+        target_kind=None,
+        stress_mode=stress_mode,
+        template=template,
+    )
+    if subquery is None:
+        return None
+    return Exists(subquery=subquery, negated=(random.random() < 0.18))
+
+
+def _build_subquery_query(
+    schema: Schema,
+    target_kind: Optional[str],
+    stress_mode: str = "balanced",
+    template: Optional[Dict[str, object]] = None,
+) -> Optional[QueryNode]:
+    base_candidates = _subquery_projection_candidates(schema, target_kind)
+    if not base_candidates:
+        return None
+
+    table, column = random.choice(base_candidates)
+    alias = f"{table.name[0]}s"
+    node: QueryNode = Scan(table.name, alias)
+    sub_ctx = GenContext()
+    _add_table_to_ctx(sub_ctx, table, alias)
+
+    if schema.fk_pairs() and stress_mode in ("join_heavy", "groupby_heavy", "orderby_heavy", "subquery_heavy", "combo_heavy") and random.random() < 0.55:
+        candidates = _find_join_extensions(schema, {table.name})
+        if candidates:
+            extension = _choose_join_extension(
+                candidates,
+                "join_heavy" if stress_mode == "combo_heavy" else stress_mode,
+                template=template,
+                join_step=0,
+                target_joins=1,
+            )
+            join_table = schema.get_table(extension["new_table"])
+            if join_table is not None:
+                join_alias = _make_unique_alias(f"{join_table.name[0]}s", {alias})
+                join_type = JoinType.LEFT if extension["left_join_safe"] and random.random() < 0.25 else JoinType.INNER
+                node = Join(
+                    left=node,
+                    right=Scan(join_table.name, join_alias),
+                    on=_make_fk_condition_for_extension(
+                        extension["fk"],
+                        alias,
+                        join_alias,
+                        extension["existing_table"],
+                        extension["new_table"],
+                    ),
+                    join_type=join_type,
+                )
+                _add_table_to_ctx(
+                    sub_ctx,
+                    join_table,
+                    join_alias,
+                    query_nullable=(join_type == JoinType.LEFT),
+                    mark_left_join_right=(join_type == JoinType.LEFT),
+                )
+
+    filter_mode = "groupby_heavy" if stress_mode == "combo_heavy" else stress_mode
+    if sub_ctx.visible_cols and random.random() < 0.75:
+        cond = _generate_condition(
+            sub_ctx,
+            schema,
+            stress_mode=filter_mode,
+            template={"predicate_depth": max(1, int((template or {}).get("predicate_depth", 2)) - 1)},
+            allow_subquery=False,
+        )
+        if cond is not None:
+            node = Filter(condition=cond, child=node)
+
+    project_field = f"{alias}.{column.name}"
+    if stress_mode in ("subquery_heavy", "combo_heavy") and target_kind == "numeric" and random.random() < 0.35:
+        agg_alias = f"max_{project_field.replace('.', '_')}"
+        node = GroupBy(
+            fields=[project_field],
+            aggregates=[Aggregate(AggFunc.MAX, project_field, agg_alias)],
+            child=node,
+        )
+        if random.random() < 0.55:
+            node = Having(
+                condition=Compare(agg_alias, random.choice([CmpOp.GTE, CmpOp.GT, CmpOp.LTE]), random.randint(0, 100)),
+                child=node,
+            )
+        project_field = project_field
+
+    node = Project(fields=[project_field], child=node)
+
+    if random.random() < 0.45:
+        node = Distinct(child=node)
+    if random.random() < (0.6 if stress_mode in ("subquery_heavy", "combo_heavy") else 0.25):
+        node = OrderBy(
+            keys=[OrderKey(project_field, descending=random.random() < 0.5)],
+            child=node,
+        )
+        if random.random() < (0.5 if stress_mode in ("subquery_heavy", "combo_heavy") else 0.15):
+            node = LimitOffset(limit=random.randint(1, 4), offset=random.randint(0, 1), child=node)
+
+    return node
+
+
+def _subquery_projection_candidates(
+    schema: Schema,
+    target_kind: Optional[str],
+) -> List[Tuple[TableSchema, object]]:
+    candidates: List[Tuple[TableSchema, object]] = []
+    for table in schema.tables:
+        for column in table.columns:
+            if target_kind == "numeric" and column.col_type not in (ColType.INT, ColType.FLOAT):
+                continue
+            if target_kind == "string" and column.col_type != ColType.VARCHAR:
+                continue
+            candidates.append((table, column))
+    return candidates
 
 
 def _generate_condition(
@@ -805,6 +1087,7 @@ def _generate_condition(
     depth: int = 0,
     stress_mode: str = "balanced",
     template: Optional[Dict[str, object]] = None,
+    allow_subquery: bool = True,
 ) -> Optional[Condition]:
     numeric_cols = _get_numeric_cols(ctx)
     string_cols = _get_string_cols(ctx)
@@ -830,7 +1113,8 @@ def _generate_condition(
         if forced is not None:
             return forced
 
-    if depth >= 2:
+    max_depth = int((template or {}).get("predicate_depth", 2))
+    if depth >= max_depth:
         return _make_compare(
             numeric_cols,
             string_cols,
@@ -865,17 +1149,27 @@ def _generate_condition(
             stress_mode,
         )
     if roll < 0.78:
-        left = _generate_condition(ctx, schema, depth + 1, stress_mode, template=template)
-        right = _generate_condition(ctx, schema, depth + 1, stress_mode, template=template)
+        left = _generate_condition(ctx, schema, depth + 1, stress_mode, template=template, allow_subquery=allow_subquery)
+        right = _generate_condition(ctx, schema, depth + 1, stress_mode, template=template, allow_subquery=allow_subquery)
         if left and right:
             return And(left, right)
         return left or right
     if roll < 0.94:
-        left = _generate_condition(ctx, schema, depth + 1, stress_mode, template=template)
-        right = _generate_condition(ctx, schema, depth + 1, stress_mode, template=template)
+        left = _generate_condition(ctx, schema, depth + 1, stress_mode, template=template, allow_subquery=allow_subquery)
+        right = _generate_condition(ctx, schema, depth + 1, stress_mode, template=template, allow_subquery=allow_subquery)
         if left and right:
             return Or(left, right)
         return left or right
+
+    if allow_subquery and schema is not None and depth == 0 and random.random() < 0.16:
+        subquery_cond = _generate_subquery_condition(
+            ctx,
+            schema,
+            stress_mode=stress_mode,
+            template=template,
+        )
+        if subquery_cond is not None:
+            return subquery_cond
 
     child = _make_compare(
         numeric_cols,
@@ -1016,6 +1310,7 @@ def _choose_project_fields(
     candidates = ctx.group_fields + ctx.agg_aliases if ctx.has_groupby else ctx.visible_cols
     if not candidates:
         return []
+    max_project_fields = max(1, int((template or {}).get("max_project_fields", 4)))
 
     if ctx.has_groupby:
         chosen = []
@@ -1028,7 +1323,7 @@ def _choose_project_fields(
         chosen = _dedupe_keep_order(chosen)
         remaining = [field for field in candidates if field not in chosen]
         if remaining:
-            extra_budget = min(2, len(remaining))
+            extra_budget = min(max(0, max_project_fields - len(chosen)), len(remaining))
             extra_num = random.randint(0, extra_budget) if extra_budget > 0 else 0
             if extra_num > 0:
                 chosen.extend(random.sample(remaining, extra_num))
@@ -1075,7 +1370,7 @@ def _choose_project_fields(
             chosen = random.sample(nullable_fields, random.randint(1, len(nullable_fields)))
             return _extend_projection(candidates, chosen, extra_limit=2)
 
-    pick_num = random.randint(1, len(candidates))
+    pick_num = random.randint(1, min(len(candidates), max_project_fields))
     return random.sample(candidates, pick_num)
 
 
@@ -1251,11 +1546,13 @@ def _choose_group_fields(
     if not group_pool:
         return []
 
-    if template and template.get("require_groupby") and stress_mode == "groupby_heavy":
-        pick_num = min(2, len(group_pool))
+    max_group_fields = max(1, int((template or {}).get("max_group_fields", 2)))
+
+    if template and template.get("require_groupby") and stress_mode in ("groupby_heavy", "combo_heavy"):
+        pick_num = min(max_group_fields, len(group_pool))
         return random.sample(group_pool, pick_num)
 
-    pick_num = random.randint(1, min(2, len(group_pool)))
+    pick_num = random.randint(1, min(max_group_fields, len(group_pool)))
     return random.sample(group_pool, pick_num)
 
 
@@ -1288,6 +1585,8 @@ def _choose_agg_func(
 
     if template and template.get("require_groupby") and random.random() < 0.35:
         return random.choice([AggFunc.COUNT, AggFunc.AVG, AggFunc.MAX, AggFunc.MIN])
+    if stress_mode == "combo_heavy" and random.random() < 0.45:
+        return random.choice([AggFunc.COUNT, AggFunc.SUM, AggFunc.AVG, AggFunc.MAX])
 
     return random.choice(list(AggFunc))
 
@@ -1353,6 +1652,10 @@ def _should_apply_distinct(
         distinct_prob = 0.18
     elif stress_mode == "distinct_heavy":
         distinct_prob = 0.9
+    elif stress_mode == "subquery_heavy":
+        distinct_prob = 0.2
+    elif stress_mode == "combo_heavy":
+        distinct_prob = 0.85
 
     return random.random() < distinct_prob
 
@@ -1374,6 +1677,10 @@ def _should_apply_limit_offset(
         limit_offset_prob = 0.38
     elif stress_mode == "distinct_heavy":
         limit_offset_prob = 0.18
+    elif stress_mode == "subquery_heavy":
+        limit_offset_prob = 0.2
+    elif stress_mode == "combo_heavy":
+        limit_offset_prob = 0.75
 
     if template and template.get("require_orderby"):
         limit_offset_prob = max(limit_offset_prob, 0.14)
@@ -1406,6 +1713,10 @@ def _choose_orderby_keys(
             orderby_prob = 0.95
         elif stress_mode == "distinct_heavy":
             orderby_prob = 0.65
+        elif stress_mode == "subquery_heavy":
+            orderby_prob = 0.72
+        elif stress_mode == "combo_heavy":
+            orderby_prob = 0.95
         should_orderby = random.random() < orderby_prob
 
     if not should_orderby:
@@ -1501,6 +1812,20 @@ def _apply_stress_mode(
             min(1.0, groupby_prob + 0.05),
             having_prob,
         )
+    if stress_mode == "subquery_heavy":
+        return (
+            min(1.0, join_prob + 0.18),
+            min(1.0, filter_prob + 0.2),
+            min(1.0, groupby_prob + 0.12),
+            min(1.0, having_prob + 0.08),
+        )
+    if stress_mode == "combo_heavy":
+        return (
+            min(1.0, join_prob + 0.28),
+            min(1.0, filter_prob + 0.22),
+            min(1.0, groupby_prob + 0.28),
+            min(1.0, having_prob + 0.22),
+        )
     return join_prob, filter_prob, groupby_prob, having_prob
 
 
@@ -1523,6 +1848,8 @@ if __name__ == "__main__":
         "null_heavy",
         "orderby_heavy",
         "distinct_heavy",
+        "subquery_heavy",
+        "combo_heavy",
     ):
         ir, ctx = generate_ir(schema, stress_mode=mode, seed=7)
         print(f"--- mode={mode} ---")

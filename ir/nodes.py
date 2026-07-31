@@ -79,6 +79,19 @@ class Like:
 
 
 @dataclass
+class Exists:
+    subquery: "QueryNode"
+    negated: bool = False
+
+
+@dataclass
+class InSubquery:
+    field: "ValueExpr"
+    subquery: "QueryNode"
+    negated: bool = False
+
+
+@dataclass
 class And:
     left: "Condition"
     right: "Condition"
@@ -108,7 +121,7 @@ class CaseWhen:
 
 
 ValueExpr = Union[str, int, float, None, ArithExpr, CaseWhen]
-Condition = Union[Compare, InList, Between, Like, And, Or, Not]
+Condition = Union[Compare, InList, Between, Like, Exists, InSubquery, And, Or, Not]
 
 
 @dataclass
@@ -294,6 +307,17 @@ def _fmt_condition(cond) -> str:
     if isinstance(cond, Like):
         prefix = "NOT " if cond.negated else ""
         return f"{prefix}Like(field={_fmt_expr(cond.field)}, pattern={cond.pattern!r})"
+    if isinstance(cond, Exists):
+        prefix = "NOT " if cond.negated else ""
+        subquery = pretty_print(cond.subquery, 1)
+        return f"{prefix}Exists(\n  subquery=\n{subquery}\n)"
+    if isinstance(cond, InSubquery):
+        prefix = "NOT " if cond.negated else ""
+        subquery = pretty_print(cond.subquery, 1)
+        return (
+            f"{prefix}InSubquery(field={_fmt_expr(cond.field)},\n"
+            f"  subquery=\n{subquery}\n)"
+        )
     if isinstance(cond, And):
         return f"And({_fmt_condition(cond.left)}, {_fmt_condition(cond.right)})"
     if isinstance(cond, Or):

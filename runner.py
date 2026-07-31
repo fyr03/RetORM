@@ -51,6 +51,7 @@ from ir.nodes import (
     ArithOp,
     Between,
     CaseWhen,
+    Exists,
     pretty_print,
     Scan,
     Filter,
@@ -60,6 +61,7 @@ from ir.nodes import (
     Project,
     Distinct,
     InList,
+    InSubquery,
     Like,
     LimitOffset,
     OrderBy,
@@ -217,6 +219,10 @@ class RunStats:
     like_predicate_queries: int = 0
     arithmetic_expr_queries: int = 0
     case_when_queries:      int = 0
+    subquery_queries:       int = 0
+    exists_subquery_queries: int = 0
+    in_subquery_queries:    int = 0
+    distinct_order_limit_queries: int = 0
     left_join_null_queries: int = 0
     left_join_groupby_queries: int = 0
     left_join_having_queries: int = 0
@@ -621,10 +627,12 @@ def _gen_ir_code(node) -> str:
         CaseWhen,
         Compare,
         Distinct,
+        Exists,
         Filter,
         GroupBy,
         Having,
         InList,
+        InSubquery,
         Join,
         Like,
         LimitOffset,
@@ -717,6 +725,13 @@ def _gen_ir_code(node) -> str:
         return (
             f"Like(field={_gen_ir_code(node.field)}, pattern={node.pattern!r}, "
             f"negated={node.negated!r})"
+        )
+    if isinstance(node, Exists):
+        return f"Exists(subquery={_gen_ir_code(node.subquery)}, negated={node.negated!r})"
+    if isinstance(node, InSubquery):
+        return (
+            f"InSubquery(field={_gen_ir_code(node.field)}, "
+            f"subquery={_gen_ir_code(node.subquery)}, negated={node.negated!r})"
         )
     if isinstance(node, And):
         return f"And(left={_gen_ir_code(node.left)}, right={_gen_ir_code(node.right)})"
@@ -1129,6 +1144,14 @@ def _record_query_shape(stats: RunStats, ir) -> None:
         stats.arithmetic_expr_queries += 1
     if features["has_case_when"]:
         stats.case_when_queries += 1
+    if features["has_subquery"]:
+        stats.subquery_queries += 1
+    if features["has_exists_subquery"]:
+        stats.exists_subquery_queries += 1
+    if features["has_in_subquery"]:
+        stats.in_subquery_queries += 1
+    if features["has_distinct_order_limit"]:
+        stats.distinct_order_limit_queries += 1
     if features["has_left_join_null"]:
         stats.left_join_null_queries += 1
     if features["has_left_join_groupby"]:
@@ -1171,6 +1194,10 @@ def _collect_query_features(node) -> dict:
         "has_like": False,
         "has_arithmetic_expr": False,
         "has_case_when": False,
+        "has_subquery": False,
+        "has_exists_subquery": False,
+        "has_in_subquery": False,
+        "has_distinct_order_limit": False,
         "has_left_join_null": False,
         "has_left_join_groupby": False,
         "has_left_join_having": False,
@@ -1257,6 +1284,17 @@ def _collect_query_features(node) -> dict:
                 features["has_left_join_right_predicate"] = True
             visit_expr(cond.field)
             return
+        if isinstance(cond, Exists):
+            features["has_subquery"] = True
+            features["has_exists_subquery"] = True
+            visit(cond.subquery)
+            return
+        if isinstance(cond, InSubquery):
+            features["has_subquery"] = True
+            features["has_in_subquery"] = True
+            visit_expr(cond.field)
+            visit(cond.subquery)
+            return
         if isinstance(cond, And) or isinstance(cond, Or):
             visit_condition(cond.left, track_right_usage)
             visit_condition(cond.right, track_right_usage)
@@ -1333,6 +1371,9 @@ def _collect_query_features(node) -> dict:
     features["has_left_join_null"] = features["has_left_join"] and features["has_null_predicate"]
     features["has_left_join_groupby"] = features["has_left_join"] and features["has_groupby"]
     features["has_left_join_having"] = features["has_left_join"] and features["has_having"]
+    features["has_distinct_order_limit"] = (
+        features["has_distinct"] and features["has_orderby"] and features["has_limit_offset"]
+    )
     return features
 
 
@@ -1359,7 +1400,7 @@ def _format_run_stats_lines(
         f"  passed      : {stats.passed}  ({pass_rate}),  empty results   : {stats.empty_results}  ({empty_rate}),  errors  : {stats.errors}  ({error_rate})",
         f"  SQL bug   : {stats.sql_bugs},  ORM bug   : {stats.orm_bugs},  SQL/ORM diff  : {stats.sql_orm_divergences},  ref anomaly  : {stats.ref_path_anomalies},  bug total  : {bug_total}  ({bug_rate})",
         f"  structure coverage  : single table={stats.single_table_queries}, join={stats.join_queries}, multi join={stats.multi_join_queries}, left join={stats.left_join_queries}, filter={stats.filter_queries}, group by={stats.groupby_queries}, having={stats.having_queries}, distinct={stats.distinct_queries}, order by={stats.orderby_queries}, order by agg={stats.orderby_agg_queries}, duplicate projection={stats.duplicate_proj_queries}, null predicate={stats.null_predicate_queries}",
-        f"  syntax coverage  : limit/offset={stats.limit_offset_queries}, IN={stats.in_list_predicate_queries}, BETWEEN={stats.between_predicate_queries}, LIKE={stats.like_predicate_queries}, arithmetic={stats.arithmetic_expr_queries}, CASE={stats.case_when_queries}",
+        f"  syntax coverage  : limit/offset={stats.limit_offset_queries}, IN={stats.in_list_predicate_queries}, BETWEEN={stats.between_predicate_queries}, LIKE={stats.like_predicate_queries}, arithmetic={stats.arithmetic_expr_queries}, CASE={stats.case_when_queries}, subquery={stats.subquery_queries}, EXISTS={stats.exists_subquery_queries}, IN-subquery={stats.in_subquery_queries}, distinct+order+limit={stats.distinct_order_limit_queries}",
         f"  left join combinations  : LEFT+NULL={stats.left_join_null_queries}, LEFT+GroupBy={stats.left_join_groupby_queries}, LEFT+Having={stats.left_join_having_queries}, LEFT+right projection={stats.left_join_right_proj_queries}, LEFT+right predicate={stats.left_join_right_predicate_queries}",
     ]
 
@@ -1392,6 +1433,10 @@ def _print_final_report(stats: RunStats, bug_dir: str = "bugs") -> None:
     print(f"    LIKE Pred : {stats.like_predicate_queries}")
     print(f"    ArithExpr : {stats.arithmetic_expr_queries}")
     print(f"    CASE WHEN : {stats.case_when_queries}")
+    print(f"    Subquery  : {stats.subquery_queries}")
+    print(f"    EXISTS    : {stats.exists_subquery_queries}")
+    print(f"    IN-Subq   : {stats.in_subquery_queries}")
+    print(f"    Dist+Ord+Lim : {stats.distinct_order_limit_queries}")
     print(f"    duplicate_proj_queries  : {stats.duplicate_proj_queries}")
     print(f"    NULL Pred   : {stats.null_predicate_queries}")
     print("  left join combinations    :")
@@ -1440,6 +1485,8 @@ def _choose_stress_mode(query_seed: int, stats: Optional[RunStats] = None) -> st
         "null_heavy": 0.9,
         "orderby_heavy": 1.0,
         "distinct_heavy": 0.9,
+        "subquery_heavy": 1.0,
+        "combo_heavy": 1.0,
     }
 
     if stats is not None and stats.total_queries > 0:
@@ -1459,6 +1506,10 @@ def _choose_stress_mode(query_seed: int, stats: Optional[RunStats] = None) -> st
         orderby_agg_gap = deficit(stats.orderby_agg_queries, 0.06)
         duplicate_gap = deficit(stats.duplicate_proj_queries, 0.12)
         null_gap = deficit(stats.null_predicate_queries, 0.08)
+        subquery_gap = deficit(stats.subquery_queries, 0.12)
+        exists_gap = deficit(stats.exists_subquery_queries, 0.05)
+        in_subquery_gap = deficit(stats.in_subquery_queries, 0.06)
+        distinct_order_limit_gap = deficit(stats.distinct_order_limit_queries, 0.05)
         left_combo_gap = deficit(stats.left_join_null_queries, 0.025)
         right_proj_gap = deficit(stats.left_join_right_proj_queries, 0.04)
 
@@ -1468,12 +1519,22 @@ def _choose_stress_mode(query_seed: int, stats: Optional[RunStats] = None) -> st
         weights["null_heavy"] += 2.6 * null_gap + 2.2 * left_join_gap + 1.8 * left_combo_gap
         weights["orderby_heavy"] += 3.0 * orderby_gap + 1.4 * right_proj_gap + 1.2 * orderby_agg_gap
         weights["distinct_heavy"] += 2.8 * distinct_gap + 1.6 * duplicate_gap
+        weights["subquery_heavy"] += 3.0 * subquery_gap + 1.8 * exists_gap + 1.8 * in_subquery_gap
+        weights["combo_heavy"] += (
+            2.6 * multi_join_gap
+            + 2.4 * distinct_order_limit_gap
+            + 1.8 * subquery_gap
+            + 1.8 * left_combo_gap
+            + 1.6 * orderby_agg_gap
+        )
 
         if total < 50:
             weights["balanced"] *= 0.7
             weights["join_heavy"] += 0.6
             weights["groupby_heavy"] += 0.4
             weights["orderby_heavy"] += 0.4
+            weights["subquery_heavy"] += 0.5
+            weights["combo_heavy"] += 0.5
 
     total_weight = sum(weights.values())
     roll = rng.random() * total_weight
