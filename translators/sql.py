@@ -11,7 +11,6 @@ from typing import List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from db.connector import execute_sql
 from ir.nodes import (
     AggFunc,
     Aggregate,
@@ -23,6 +22,7 @@ from ir.nodes import (
     CmpOp,
     Compare,
     Condition,
+    DerivedTable,
     Distinct,
     Exists,
     Filter,
@@ -41,7 +41,12 @@ from ir.nodes import (
     Project,
     QueryNode,
     Scan,
+    ScalarSubquery,
     SelectItem,
+    SetOp,
+    SetQuery,
+    WindowExpr,
+    WindowFunc,
 )
 
 
@@ -57,12 +62,16 @@ class QueryParts:
 
 
 def execute(ir: QueryNode) -> List[dict]:
+    from db.connector import execute_sql
+
     sql = translate(ir)
     print(f"[sql] generated SQL:\n  {sql}")
     return execute_sql(sql)
 
 
 def translate(ir: QueryNode) -> str:
+    if isinstance(ir, SetQuery):
+        return _translate_set_query(ir) + ";"
     parts = _build_parts(ir)
     lines = [parts.select_clause, parts.from_clause]
     if parts.where_clause:
@@ -83,6 +92,11 @@ def _build_parts(node: QueryNode) -> QueryParts:
         return QueryParts(
             select_clause="SELECT *",
             from_clause=f"FROM `{node.table}` AS `{node.alias}`",
+        )
+    if isinstance(node, DerivedTable):
+        return QueryParts(
+            select_clause="SELECT *",
+            from_clause=f"FROM ({_translate_derived_subquery(node.subquery)}) AS `{node.alias}`",
         )
     if isinstance(node, Filter):
         parts = _build_parts(node.child)
@@ -160,6 +174,8 @@ def _build_parts(node: QueryNode) -> QueryParts:
 def _render_from_expr(node: QueryNode) -> str:
     if isinstance(node, Scan):
         return f"`{node.table}` AS `{node.alias}`"
+    if isinstance(node, DerivedTable):
+        return f"({_translate_derived_subquery(node.subquery)}) AS `{node.alias}`"
     if isinstance(node, Join):
         join_keyword = "LEFT JOIN" if node.join_type == JoinType.LEFT else "INNER JOIN"
         on = _translate_condition(node.on)
@@ -247,6 +263,12 @@ def _translate_expr(expr, agg_expr_map: Optional[dict] = None, prefer_field: boo
         else_sql = _translate_expr(expr.else_value, agg_expr_map=agg_expr_map, prefer_field=False)
         return f"(CASE {' '.join(parts)} ELSE {else_sql} END)"
 
+    if isinstance(expr, ScalarSubquery):
+        return f"({_translate_subquery(expr.subquery)})"
+
+    if isinstance(expr, WindowExpr):
+        return _translate_window_expr(expr, agg_expr_map=agg_expr_map)
+
     if isinstance(expr, str):
         if expr in agg_expr_map:
             return agg_expr_map[expr]
@@ -261,6 +283,35 @@ def _translate_order_key(key: OrderKey, agg_expr_map: Optional[dict] = None) -> 
     field_expr = _translate_expr(key.field, agg_expr_map=agg_expr_map or {}, prefer_field=True)
     suffix = "DESC" if key.descending else "ASC"
     return f"{field_expr} {suffix}"
+
+
+def _translate_window_expr(expr: WindowExpr, agg_expr_map: Optional[dict] = None) -> str:
+    agg_expr_map = agg_expr_map or {}
+    if expr.func in {WindowFunc.ROW_NUMBER, WindowFunc.RANK, WindowFunc.DENSE_RANK}:
+        base = f"{expr.func.value}()"
+    else:
+        if expr.field == "*":
+            base = f"{expr.func.value}(*)"
+        else:
+            field_sql = _translate_expr(expr.field, agg_expr_map=agg_expr_map, prefer_field=True)
+            base = f"{expr.func.value}({field_sql})"
+
+    over_parts = []
+    if expr.partition_by:
+        over_parts.append(
+            "PARTITION BY " + ", ".join(
+                _translate_expr(item, agg_expr_map=agg_expr_map, prefer_field=True)
+                for item in expr.partition_by
+            )
+        )
+    if expr.order_by:
+        over_parts.append(
+            "ORDER BY " + ", ".join(
+                _translate_order_key(item, agg_expr_map=agg_expr_map)
+                for item in expr.order_by
+            )
+        )
+    return f"{base} OVER ({' '.join(over_parts)})"
 
 
 def _translate_aggregate(agg: Aggregate) -> str:
@@ -307,6 +358,46 @@ def _translate_subquery(node: QueryNode) -> str:
     return translate(node).rstrip(";")
 
 
+def _translate_derived_subquery(node: QueryNode) -> str:
+    if isinstance(node, Project):
+        parts = _build_parts(node.child)
+        agg_expr_map = _collect_agg_exprs(node.child)
+        exprs = []
+        for field in node.fields:
+            if isinstance(field, SelectItem):
+                exprs.append(
+                    f"{_translate_expr(field.expr, agg_expr_map=agg_expr_map, prefer_field=True)} AS `{field.alias}`"
+                )
+            elif isinstance(field, str):
+                label = _derived_output_name(field)
+                exprs.append(
+                    f"{_translate_expr(field, agg_expr_map=agg_expr_map, prefer_field=True)} AS `{label}`"
+                )
+            else:
+                raise NotImplementedError(f"unsupported derived projection field: {type(field)}")
+        parts.select_clause = f"SELECT {', '.join(exprs)}"
+        lines = [parts.select_clause, parts.from_clause]
+        if parts.where_clause:
+            lines.append(f"WHERE {parts.where_clause}")
+        if parts.groupby_clause:
+            lines.append(f"GROUP BY {parts.groupby_clause}")
+        if parts.having_clause:
+            lines.append(f"HAVING {parts.having_clause}")
+        if parts.orderby_clause:
+            lines.append(f"ORDER BY {parts.orderby_clause}")
+        if parts.limit_clause:
+            lines.append(parts.limit_clause)
+        return "\n".join(lines)
+    return _translate_subquery(node)
+
+
+def _translate_set_query(node: SetQuery) -> str:
+    left_sql = _translate_subquery(node.left)
+    right_sql = _translate_subquery(node.right)
+    op = node.op.value + (" ALL" if node.all else "")
+    return f"({left_sql})\n{op}\n({right_sql})"
+
+
 def _translate_in_subquery(node: QueryNode) -> str:
     """
     MySQL rejects LIMIT directly inside IN/ALL/ANY/SOME subqueries.
@@ -322,11 +413,20 @@ def _translate_in_subquery(node: QueryNode) -> str:
 def _query_has_limit_offset(node: QueryNode) -> bool:
     if isinstance(node, LimitOffset):
         return True
+    if isinstance(node, (Filter, GroupBy, Having, Project, Distinct, OrderBy, DerivedTable)):
+        child = node.subquery if isinstance(node, DerivedTable) else node.child
+        return _query_has_limit_offset(child)
+    if isinstance(node, SetQuery):
+        return _query_has_limit_offset(node.left) or _query_has_limit_offset(node.right)
     if isinstance(node, (Filter, GroupBy, Having, Project, Distinct, OrderBy)):
         return _query_has_limit_offset(node.child)
     if isinstance(node, Join):
         return _query_has_limit_offset(node.left) or _query_has_limit_offset(node.right)
     return False
+
+
+def _derived_output_name(field_name: str) -> str:
+    return field_name.split(".", 1)[1] if "." in field_name else field_name
 
 
 def _quote_field(field_name: str) -> str:

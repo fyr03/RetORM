@@ -42,6 +42,23 @@ class ArithOp(Enum):
     MOD = "%"
 
 
+class WindowFunc(Enum):
+    ROW_NUMBER = "ROW_NUMBER"
+    RANK = "RANK"
+    DENSE_RANK = "DENSE_RANK"
+    SUM = "SUM"
+    COUNT = "COUNT"
+    AVG = "AVG"
+    MAX = "MAX"
+    MIN = "MIN"
+
+
+class SetOp(Enum):
+    UNION = "UNION"
+    INTERSECT = "INTERSECT"
+    EXCEPT = "EXCEPT"
+
+
 @dataclass
 class ArithExpr:
     left: "ValueExpr"
@@ -120,7 +137,26 @@ class CaseWhen:
     else_value: "ValueExpr"
 
 
-ValueExpr = Union[str, int, float, None, ArithExpr, CaseWhen]
+@dataclass
+class ScalarSubquery:
+    subquery: "QueryNode"
+
+
+@dataclass
+class WindowExpr:
+    func: WindowFunc
+    field: Optional[Union[str, "ValueExpr"]] = None
+    partition_by: List["ValueExpr"] = None
+    order_by: List["OrderKey"] = None
+
+    def __post_init__(self):
+        if self.partition_by is None:
+            self.partition_by = []
+        if self.order_by is None:
+            self.order_by = []
+
+
+ValueExpr = Union[str, int, float, None, ArithExpr, CaseWhen, ScalarSubquery, WindowExpr]
 Condition = Union[Compare, InList, Between, Like, Exists, InSubquery, And, Or, Not]
 
 
@@ -151,6 +187,12 @@ class Scan:
     def __post_init__(self):
         if self.alias is None:
             self.alias = self.table
+
+
+@dataclass
+class DerivedTable:
+    subquery: "QueryNode"
+    alias: str
 
 
 @dataclass
@@ -204,7 +246,27 @@ class LimitOffset:
     child: "QueryNode" = None
 
 
-QueryNode = Union[Scan, Filter, Join, GroupBy, Having, Project, Distinct, OrderBy, LimitOffset]
+@dataclass
+class SetQuery:
+    left: "QueryNode"
+    right: "QueryNode"
+    op: SetOp
+    all: bool = False
+
+
+QueryNode = Union[
+    Scan,
+    DerivedTable,
+    Filter,
+    Join,
+    GroupBy,
+    Having,
+    Project,
+    Distinct,
+    OrderBy,
+    LimitOffset,
+    SetQuery,
+]
 
 
 def pretty_print(node, indent: int = 0) -> str:
@@ -212,6 +274,10 @@ def pretty_print(node, indent: int = 0) -> str:
 
     if isinstance(node, Scan):
         return f"{pad}Scan(table={node.table!r}, alias={node.alias!r})"
+
+    if isinstance(node, DerivedTable):
+        child_str = pretty_print(node.subquery, indent + 1)
+        return f"{pad}DerivedTable(\n{pad}  alias={node.alias!r},\n{pad}  subquery=\n{child_str}\n{pad})"
 
     if isinstance(node, Filter):
         cond = _fmt_condition(node.condition)
@@ -270,6 +336,14 @@ def pretty_print(node, indent: int = 0) -> str:
             f"{pad}  child=\n{child_str}\n{pad})"
         )
 
+    if isinstance(node, SetQuery):
+        left_str = pretty_print(node.left, indent + 1)
+        right_str = pretty_print(node.right, indent + 1)
+        return (
+            f"{pad}SetQuery(\n{pad}  op={node.op.value!r},\n{pad}  all={node.all!r},\n"
+            f"{pad}  left=\n{left_str},\n{pad}  right=\n{right_str}\n{pad})"
+        )
+
     return f"{pad}{repr(node)}"
 
 
@@ -288,6 +362,17 @@ def _fmt_expr(expr) -> str:
             for case in expr.cases
         ]
         return f"CaseWhen(cases={cases}, else_value={_fmt_expr(expr.else_value)})"
+    if isinstance(expr, ScalarSubquery):
+        subquery = pretty_print(expr.subquery, 1)
+        return f"ScalarSubquery(\n  subquery=\n{subquery}\n)"
+    if isinstance(expr, WindowExpr):
+        parts = [
+            f"func={expr.func.value!r}",
+            f"field={_fmt_expr(expr.field) if expr.field is not None else None}",
+            f"partition_by={[_fmt_expr(item) for item in expr.partition_by]}",
+            f"order_by={[f'OrderKey({_fmt_expr(key.field)}, descending={key.descending})' for key in expr.order_by]}",
+        ]
+        return f"WindowExpr({', '.join(parts)})"
     return repr(expr)
 
 

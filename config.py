@@ -1,30 +1,29 @@
-"""
-config.py
+"""Global configuration for RetORM."""
 
-全局配置，所有模块从这里读参数，不要在各自文件里硬编码。
-"""
-
-# ---------------------------------------------------------------------------
-# MySQL 连接参数
-# conda 里的 MySQL，端口 3307
-# ---------------------------------------------------------------------------
 DB_CONFIG = {
-    "host":     "127.0.0.1",
-    "port":     3307,
-    "user":     "root",
+    "host": "127.0.0.1",
+    "port": 3307,
+    "user": "root",
     "password": "123456",
     "database": "retorm",
-    "charset":  "utf8mb4",
+    "charset": "utf8mb4",
 }
 
-# ---------------------------------------------------------------------------
-# 测试框架参数（后续随机生成阶段用到）
-# ---------------------------------------------------------------------------
-NUM_SCHEMAS     = 5      # 每轮生成多少个 schema
-QUERIES_PER_SCHEMA = 20  # 每个 schema 生成多少条 IR
-Z3_TIMEOUT_SEC  = 5      # Z3 求解器超时时间（秒）
-RANDOM_ROWS     = 10     # 随机数据生成时每张表插多少行
-EXTRA_RANDOM_ROWS = 6    # 在基础行数上额外追加的噪声随机行
-EDGE_ROWS        = 4     # 每张表追加的固定边缘行数量
-ADVERSARIAL_ROWS = 4     # 每张表追加的对抗性数据行数量
-STRESS_RETRY_BUDGET = 12 # 高压模式下为了满足结构约束的重试次数
+NUM_SCHEMAS = 5
+QUERIES_PER_SCHEMA = 20
+Z3_TIMEOUT_SEC = 5
+RANDOM_ROWS = 10
+EXTRA_RANDOM_ROWS = 6
+EDGE_ROWS = 4
+ADVERSARIAL_ROWS = 4
+STRESS_RETRY_BUDGET = 12
+
+ENABLE_REF_PATH = True
+ENABLE_CORE_PATH = False
+ENABLE_TRUE_ORM_PATH = True
+
+TRUE_ORM_JOIN_MODE = "relationship_preferred"
+TRUE_ORM_MAX_IR_ATTEMPTS = 12
+TRUE_ORM_ENTITY_PROJECTION = True
+TRUE_ORM_LOADER_STRATEGY = "off"
+TRUE_ORM_TOUCH_RELATIONSHIPS = False

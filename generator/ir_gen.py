@@ -11,6 +11,7 @@ Generation order:
 import os
 import random
 import sys
+import copy
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -29,6 +30,7 @@ from ir.nodes import (
     CmpOp,
     Compare,
     Condition,
+    DerivedTable,
     Distinct,
     Exists,
     Filter,
@@ -46,8 +48,13 @@ from ir.nodes import (
     Or,
     Project,
     QueryNode,
+    ScalarSubquery,
     Scan,
     SelectItem,
+    SetOp,
+    SetQuery,
+    WindowExpr,
+    WindowFunc,
     WhenClause,
 )
 
@@ -62,6 +69,9 @@ class GenContext:
     query_nullable_cols: set = field(default_factory=set)
     left_join_right_aliases: set = field(default_factory=set)
     projected_fields: List[str] = field(default_factory=list)
+    projected_entity_aliases: set = field(default_factory=set)
+    has_self_join: bool = False
+    has_set_query: bool = False
 
 
 def generate_ir(
@@ -120,9 +130,19 @@ def _generate_ir_once(
 
     ctx = GenContext()
     _add_table_to_ctx(ctx, main_table, main_alias)
+    used_aliases = {main_alias}
+
+    if template.get("require_self_join") or stress_mode in ("self_join_heavy", "orm_combo_heavy"):
+        node = _maybe_add_self_join(
+            node,
+            ctx,
+            main_table,
+            main_alias,
+            used_aliases,
+            stress_mode,
+        )
 
     joined_table_names = {main_table.name}
-    used_aliases = {main_alias}
     join_step = 0
     target_joins = _target_join_count(schema, stress_mode, template)
 
@@ -270,11 +290,25 @@ def _generate_ir_once(
     project_fields = _maybe_wrap_project_fields(
         project_fields,
         ctx,
+        schema,
+        stress_mode=stress_mode,
+        template=template,
+    )
+    project_fields = _maybe_promote_entity_projection_fields(
+        project_fields,
+        ctx,
         stress_mode=stress_mode,
         template=template,
     )
     if project_fields:
         node = Project(fields=project_fields, child=node)
+        ctx.projected_fields = project_fields
+        node, project_fields = _maybe_wrap_with_derived_table(
+            node,
+            project_fields,
+            stress_mode=stress_mode,
+            template=template,
+        )
         ctx.projected_fields = project_fields
 
     if project_fields and _should_apply_distinct(stress_mode, template):
@@ -296,6 +330,13 @@ def _generate_ir_once(
         limit = random.randint(1, 5)
         offset = random.randint(0, 3)
         node = LimitOffset(limit=limit, offset=offset, child=node)
+
+    node = _maybe_wrap_with_set_query(
+        node,
+        ctx,
+        stress_mode=stress_mode,
+        template=template,
+    )
 
     return node, ctx
 
@@ -326,6 +367,10 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
         "require_subquery": False,
         "prefer_exists_subquery": False,
         "force_distinct_order_limit": False,
+        "require_entity_projection": False,
+        "prefer_entity_scalar_mix": False,
+        "require_self_join": False,
+        "require_set_query": False,
         "predicate_depth": 2,
         "max_group_fields": 2,
         "max_project_fields": 4,
@@ -429,6 +474,88 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
                 "max_project_fields": 5,
             }
         )
+    elif stress_mode == "relationship_heavy":
+        template.update(
+            {
+                "target_joins": 2 if can_multi_join else (1 if can_join else 0),
+                "require_filter": True,
+                "require_orderby": True,
+                "force_right_projection": can_join,
+                "prefer_sparse_projection": False,
+                "min_aggs": 1,
+                "max_aggs": 2,
+                "count_field_prob": 0.32,
+                "predicate_depth": 3,
+                "max_project_fields": 5,
+            }
+        )
+    elif stress_mode == "entity_heavy":
+        template.update(
+            {
+                "target_joins": 1 if can_join else 0,
+                "require_filter": True,
+                "require_orderby": True,
+                "require_entity_projection": True,
+                "prefer_entity_scalar_mix": True,
+                "min_aggs": 1,
+                "max_aggs": 2,
+                "count_field_prob": 0.22,
+                "predicate_depth": 3,
+                "max_project_fields": 6,
+            }
+        )
+    elif stress_mode == "self_join_heavy":
+        template.update(
+            {
+                "target_joins": 1,
+                "require_filter": True,
+                "require_self_join": True,
+                "require_orderby": True,
+                "min_aggs": 1,
+                "max_aggs": 2,
+                "count_field_prob": 0.22,
+                "predicate_depth": 3,
+                "max_project_fields": 5,
+            }
+        )
+    elif stress_mode == "setop_heavy":
+        template.update(
+            {
+                "require_set_query": True,
+                "require_filter": True,
+                "require_orderby": True,
+                "prefer_entity_scalar_mix": True,
+                "predicate_depth": 3,
+                "max_project_fields": 5,
+            }
+        )
+    elif stress_mode == "loader_heavy":
+        template.update(
+            {
+                "target_joins": 1 if can_join else 0,
+                "require_filter": True,
+                "require_orderby": True,
+                "require_entity_projection": True,
+                "prefer_entity_scalar_mix": True,
+                "force_limit_offset": True,
+                "predicate_depth": 3,
+                "max_project_fields": 5,
+            }
+        )
+    elif stress_mode == "orm_combo_heavy":
+        template.update(
+            {
+                "target_joins": 2 if can_multi_join else (1 if can_join else 0),
+                "require_filter": True,
+                "require_orderby": True,
+                "require_entity_projection": True,
+                "prefer_entity_scalar_mix": True,
+                "require_set_query": True,
+                "require_self_join": bool(schema.tables),
+                "predicate_depth": 4,
+                "max_project_fields": 6,
+            }
+        )
     elif stress_mode == "combo_heavy":
         template.update(
             {
@@ -440,9 +567,13 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
                 "require_orderby": True,
                 "require_subquery": True,
                 "force_distinct_order_limit": True,
+                "require_entity_projection": True,
+                "prefer_entity_scalar_mix": True,
                 "prefer_exists_subquery": False,
                 "force_left_join": bool(ref_tables),
                 "force_right_projection": can_join,
+                "require_self_join": len(schema.tables) >= 1,
+                "require_set_query": True,
                 "prefer_orderby_agg": True,
                 "min_aggs": 2,
                 "max_aggs": 3,
@@ -492,9 +623,29 @@ def _ir_satisfies_stress_mode(
         return False
     if template.get("force_distinct_order_limit") and not features["has_distinct_order_limit"]:
         return False
+    if template.get("require_entity_projection") and not features["has_entity_projection"]:
+        return False
+    if template.get("prefer_entity_scalar_mix") and not features["has_entity_scalar_mix"]:
+        return False
+    if template.get("require_self_join") and not features["has_self_join"]:
+        return False
+    if template.get("require_set_query") and not features["has_set_query"]:
+        return False
 
     if stress_mode == "join_heavy":
         return features["has_join"] and features["has_orderby"]
+    if stress_mode == "relationship_heavy":
+        return features["has_join"] and features["has_orderby"] and features["has_left_join_right_projection"]
+    if stress_mode == "entity_heavy":
+        return features["has_entity_projection"] and features["has_orderby"]
+    if stress_mode == "self_join_heavy":
+        return features["has_self_join"] and features["has_orderby"]
+    if stress_mode == "setop_heavy":
+        return features["has_set_query"]
+    if stress_mode == "loader_heavy":
+        return features["has_entity_projection"] and features["has_limit_offset"]
+    if stress_mode == "orm_combo_heavy":
+        return features["has_set_query"] and features["has_entity_projection"] and features["has_self_join"]
     if stress_mode == "groupby_heavy":
         return features["has_groupby"] and features["has_having"] and features["has_orderby_agg"]
     if stress_mode == "duplicate_column_heavy":
@@ -525,11 +676,14 @@ def _collect_ir_features(node: QueryNode) -> Dict[str, object]:
         "join_count": 0,
         "has_join": False,
         "has_left_join": False,
+        "has_self_join": False,
         "has_groupby": False,
         "has_having": False,
         "has_null_predicate": False,
         "has_duplicate_projection": False,
         "has_left_join_right_projection": False,
+        "has_entity_projection": False,
+        "has_entity_scalar_mix": False,
         "has_distinct": False,
         "has_orderby": False,
         "has_orderby_agg": False,
@@ -538,6 +692,7 @@ def _collect_ir_features(node: QueryNode) -> Dict[str, object]:
         "has_exists_subquery": False,
         "has_in_subquery": False,
         "has_distinct_order_limit": False,
+        "has_set_query": False,
     }
     left_join_right_aliases = set()
 
@@ -584,10 +739,19 @@ def _collect_ir_features(node: QueryNode) -> Dict[str, object]:
             return field.alias
         return str(field)
 
+    def project_field_alias(field) -> Optional[str]:
+        if isinstance(field, str) and "." in field:
+            return field.split(".", 1)[0]
+        return None
+
     def visit(cur: QueryNode) -> None:
         if isinstance(cur, Join):
             features["has_join"] = True
             features["join_count"] += 1
+            left_aliases = collect_aliases(cur.left)
+            right_aliases = collect_aliases(cur.right)
+            if left_aliases & right_aliases:
+                features["has_self_join"] = True
             visit_condition(cur.on)
             if cur.join_type == JoinType.LEFT:
                 features["has_left_join"] = True
@@ -611,6 +775,17 @@ def _collect_ir_features(node: QueryNode) -> Dict[str, object]:
         if isinstance(cur, Project):
             short_names = [_short_field_name(project_field_name(field)) for field in cur.fields]
             features["has_duplicate_projection"] = len(short_names) != len(set(short_names))
+            alias_groups = {}
+            has_scalar_mix = any(isinstance(field, SelectItem) for field in cur.fields)
+            for field in cur.fields:
+                alias_name = project_field_alias(field)
+                if alias_name is None:
+                    continue
+                alias_groups.setdefault(alias_name, 0)
+                alias_groups[alias_name] += 1
+            if any(count >= 3 for count in alias_groups.values()):
+                features["has_entity_projection"] = True
+                features["has_entity_scalar_mix"] = has_scalar_mix or len(cur.fields) > max(alias_groups.values())
             if any(
                 field_uses_left_join_right(field) for field in cur.fields if isinstance(field, str)
             ):
@@ -630,6 +805,11 @@ def _collect_ir_features(node: QueryNode) -> Dict[str, object]:
         if isinstance(cur, LimitOffset):
             features["has_limit_offset"] = True
             visit(cur.child)
+            return
+        if isinstance(cur, SetQuery):
+            features["has_set_query"] = True
+            visit(cur.left)
+            visit(cur.right)
 
     visit(node)
     features["has_distinct_order_limit"] = (
@@ -649,7 +829,7 @@ def _choose_main_table(
         if candidates:
             return random.choice(candidates)
 
-    if stress_mode in ("join_heavy", "groupby_heavy", "duplicate_column_heavy", "subquery_heavy", "combo_heavy"):
+    if stress_mode in ("join_heavy", "relationship_heavy", "groupby_heavy", "duplicate_column_heavy", "subquery_heavy", "combo_heavy", "orm_combo_heavy", "self_join_heavy", "entity_heavy", "setop_heavy", "loader_heavy"):
         scored = []
         for table in schema.tables:
             degree = 0
@@ -758,6 +938,104 @@ def _get_left_join_right_numeric_cols(ctx: GenContext) -> List[str]:
     return result
 
 
+def _maybe_add_self_join(
+    node: QueryNode,
+    ctx: GenContext,
+    main_table: TableSchema,
+    main_alias: str,
+    used_aliases: set,
+    stress_mode: str,
+) -> QueryNode:
+    candidates = _self_join_candidate_columns(main_table)
+    if not candidates:
+        return node
+    if stress_mode not in ("self_join_heavy", "orm_combo_heavy") and random.random() >= 0.18:
+        return node
+
+    join_alias = _make_unique_alias(main_table.name[0], used_aliases)
+    join_col = random.choice(candidates)
+    node = Join(
+        left=node,
+        right=Scan(main_table.name, join_alias),
+        on=Compare(f"{main_alias}.{join_col.name}", CmpOp.EQ, f"{join_alias}.{join_col.name}"),
+        join_type=JoinType.LEFT if join_col.nullable and random.random() < 0.35 else JoinType.INNER,
+    )
+    _add_table_to_ctx(ctx, main_table, join_alias, query_nullable=False, mark_left_join_right=False)
+    used_aliases.add(join_alias)
+    ctx.has_self_join = True
+    return node
+
+
+def _self_join_candidate_columns(table: TableSchema) -> List[object]:
+    candidates = [col for col in table.non_pk_columns()]
+    preferred = [col for col in candidates if col.col_type in (ColType.VARCHAR, ColType.INT, ColType.FLOAT)]
+    return preferred or candidates
+
+
+def _maybe_promote_entity_projection_fields(
+    fields: List[object],
+    ctx: GenContext,
+    stress_mode: str = "balanced",
+    template: Optional[Dict[str, object]] = None,
+) -> List[object]:
+    if not fields or ctx.has_groupby:
+        return fields
+
+    require_entity = bool(template and template.get("require_entity_projection"))
+    if not require_entity and stress_mode not in ("entity_heavy", "loader_heavy", "orm_combo_heavy"):
+        return fields
+
+    alias = _choose_entity_projection_alias(ctx, fields)
+    if alias is None:
+        return fields
+
+    table = ctx.tables.get(alias)
+    if table is None:
+        return fields
+
+    alias_cols = [f"{alias}.{col.name}" for col in table.columns]
+    other_fields = [field for field in fields if not (isinstance(field, str) and field.startswith(f"{alias}."))]
+    promoted = list(alias_cols)
+
+    if template and template.get("prefer_entity_scalar_mix"):
+        scalar_fields = [field for field in other_fields if isinstance(field, SelectItem)]
+        if not scalar_fields:
+            numeric_fields = [field for field in other_fields if isinstance(field, str) and _field_is_numeric(ctx, field)]
+            if numeric_fields:
+                base_field = random.choice(numeric_fields)
+                promoted.append(
+                    SelectItem(
+                        expr=ArithExpr(base_field, random.choice([ArithOp.ADD, ArithOp.SUB]), random.randint(1, 4)),
+                        alias=f"{_short_field_name(base_field)}_entity_calc",
+                    )
+                )
+        promoted.extend(other_fields[:2])
+    else:
+        promoted.extend(other_fields[: max(0, min(2, len(other_fields)))])
+
+    ctx.projected_entity_aliases.add(alias)
+    return _dedupe_projection_outputs(promoted)
+
+
+def _choose_entity_projection_alias(ctx: GenContext, fields: List[object]) -> Optional[str]:
+    alias_scores = []
+    seen_aliases = {
+        field.split(".", 1)[0]
+        for field in fields
+        if isinstance(field, str) and "." in field
+    }
+    for alias in seen_aliases:
+        table = ctx.tables.get(alias)
+        if table is None or len(table.columns) < 2:
+            continue
+        numeric_count = sum(1 for col in table.columns if col.col_type in (ColType.INT, ColType.FLOAT))
+        alias_scores.append((numeric_count, len(table.columns), alias))
+    if not alias_scores:
+        return None
+    alias_scores.sort(reverse=True)
+    return alias_scores[0][2]
+
+
 def _find_joinable_fks(schema: Schema, main_table: TableSchema) -> List[ForeignKey]:
     result = []
     for fk in schema.fk_pairs():
@@ -859,7 +1137,7 @@ def _choose_join_extension(
         if preferred:
             candidates = preferred
 
-    if stress_mode in ("join_heavy", "null_heavy"):
+    if stress_mode in ("join_heavy", "relationship_heavy", "null_heavy", "loader_heavy"):
         preferred = [c for c in candidates if c["left_join_safe"]]
         if preferred and random.random() < 0.75:
             candidates = preferred
@@ -885,14 +1163,26 @@ def _extra_join_prob(stress_mode: str, join_step: int) -> float:
     base = 0.28
     if stress_mode == "join_heavy":
         base = 0.78
+    elif stress_mode == "relationship_heavy":
+        base = 0.82
     elif stress_mode == "null_heavy":
         base = 0.7
     elif stress_mode == "groupby_heavy":
         base = 0.5
+    elif stress_mode == "self_join_heavy":
+        base = 0.56
     elif stress_mode == "duplicate_column_heavy":
         base = 0.42
     elif stress_mode == "subquery_heavy":
         base = 0.62
+    elif stress_mode == "entity_heavy":
+        base = 0.58
+    elif stress_mode == "setop_heavy":
+        base = 0.4
+    elif stress_mode == "loader_heavy":
+        base = 0.66
+    elif stress_mode == "orm_combo_heavy":
+        base = 0.88
     elif stress_mode == "combo_heavy":
         base = 0.85
     return max(0.15, base - join_step * 0.1)
@@ -915,12 +1205,16 @@ def _should_apply_subquery_condition(
     prob = 0.05
     if stress_mode == "join_heavy":
         prob = 0.08
+    elif stress_mode == "relationship_heavy":
+        prob = 0.1
     elif stress_mode == "groupby_heavy":
         prob = 0.1
     elif stress_mode == "orderby_heavy":
         prob = 0.12
     elif stress_mode == "subquery_heavy":
         prob = 0.55
+    elif stress_mode in ("setop_heavy", "orm_combo_heavy"):
+        prob = 0.42
     elif stress_mode == "combo_heavy":
         prob = 0.7
     return random.random() < prob
@@ -979,6 +1273,7 @@ def _build_subquery_query(
     target_kind: Optional[str],
     stress_mode: str = "balanced",
     template: Optional[Dict[str, object]] = None,
+    force_single_row: bool = False,
 ) -> Optional[QueryNode]:
     base_candidates = _subquery_projection_candidates(schema, target_kind)
     if not base_candidates:
@@ -990,7 +1285,7 @@ def _build_subquery_query(
     sub_ctx = GenContext()
     _add_table_to_ctx(sub_ctx, table, alias)
 
-    if schema.fk_pairs() and stress_mode in ("join_heavy", "groupby_heavy", "orderby_heavy", "subquery_heavy", "combo_heavy") and random.random() < 0.55:
+    if schema.fk_pairs() and stress_mode in ("join_heavy", "relationship_heavy", "groupby_heavy", "orderby_heavy", "subquery_heavy", "combo_heavy", "loader_heavy", "orm_combo_heavy") and random.random() < 0.55:
         candidates = _find_join_extensions(schema, {table.name})
         if candidates:
             extension = _choose_join_extension(
@@ -1037,7 +1332,7 @@ def _build_subquery_query(
             node = Filter(condition=cond, child=node)
 
     project_field = f"{alias}.{column.name}"
-    if stress_mode in ("subquery_heavy", "combo_heavy") and target_kind == "numeric" and random.random() < 0.35:
+    if stress_mode in ("subquery_heavy", "setop_heavy", "combo_heavy", "orm_combo_heavy") and target_kind == "numeric" and random.random() < 0.35:
         agg_alias = f"max_{project_field.replace('.', '_')}"
         node = GroupBy(
             fields=[project_field],
@@ -1051,17 +1346,39 @@ def _build_subquery_query(
             )
         project_field = project_field
 
-    node = Project(fields=[project_field], child=node)
-
-    if random.random() < 0.45:
-        node = Distinct(child=node)
-    if random.random() < (0.6 if stress_mode in ("subquery_heavy", "combo_heavy") else 0.25):
-        node = OrderBy(
-            keys=[OrderKey(project_field, descending=random.random() < 0.5)],
+    order_field = project_field
+    if force_single_row and target_kind == "numeric" and random.random() < 0.5:
+        agg_alias = f"scalar_{project_field.replace('.', '_')}"
+        node = GroupBy(
+            fields=[],
+            aggregates=[
+                Aggregate(
+                    random.choice([AggFunc.MAX, AggFunc.MIN, AggFunc.AVG]),
+                    project_field,
+                    agg_alias,
+                )
+            ],
             child=node,
         )
-        if random.random() < (0.5 if stress_mode in ("subquery_heavy", "combo_heavy") else 0.15):
+        node = Project(fields=[agg_alias], child=node)
+        order_field = agg_alias
+    else:
+        node = Project(fields=[project_field], child=node)
+        order_field = project_field
+
+    if not force_single_row and random.random() < 0.45:
+        node = Distinct(child=node)
+    if random.random() < (0.6 if stress_mode in ("subquery_heavy", "setop_heavy", "combo_heavy", "orm_combo_heavy") else 0.25):
+        node = OrderBy(
+            keys=[OrderKey(order_field, descending=random.random() < 0.5)],
+            child=node,
+        )
+        if force_single_row:
+            node = LimitOffset(limit=1, offset=0, child=node)
+        elif random.random() < (0.5 if stress_mode in ("subquery_heavy", "setop_heavy", "combo_heavy", "orm_combo_heavy") else 0.15):
             node = LimitOffset(limit=random.randint(1, 4), offset=random.randint(0, 1), child=node)
+    elif force_single_row:
+        node = LimitOffset(limit=1, offset=0, child=node)
 
     return node
 
@@ -1295,7 +1612,7 @@ def _generate_having_condition(
         return Compare(alias_name, random.choice([CmpOp.EQ, CmpOp.NEQ]), None)
 
     alias_name = random.choice(ctx.agg_aliases)
-    if stress_mode in ("join_heavy", "null_heavy") and random.random() < 0.22:
+    if stress_mode in ("join_heavy", "relationship_heavy", "null_heavy", "loader_heavy") and random.random() < 0.22:
         return Compare(alias_name, random.choice([CmpOp.EQ, CmpOp.NEQ]), None)
     op = random.choice([CmpOp.GT, CmpOp.GTE, CmpOp.LT, CmpOp.LTE])
     val = random.randint(0, 200)
@@ -1356,11 +1673,13 @@ def _choose_project_fields(
         duplicate_prob = 0.9
     elif stress_mode == "join_heavy":
         duplicate_prob = 0.6
+    elif stress_mode == "entity_heavy":
+        duplicate_prob = 0.3
 
     if duplicate_fields and random.random() < duplicate_prob:
         return _extend_projection(candidates, duplicate_fields, extra_limit=2)
 
-    if stress_mode in ("join_heavy", "null_heavy") and right_fields and random.random() < 0.7:
+    if stress_mode in ("join_heavy", "relationship_heavy", "null_heavy", "loader_heavy") and right_fields and random.random() < 0.7:
         chosen = random.sample(right_fields, random.randint(1, len(right_fields)))
         return _extend_projection(candidates, chosen, extra_limit=2)
 
@@ -1377,6 +1696,7 @@ def _choose_project_fields(
 def _maybe_wrap_project_fields(
     fields: List[object],
     ctx: GenContext,
+    schema: Schema,
     stress_mode: str = "balanced",
     template: Optional[Dict[str, object]] = None,
 ) -> List[object]:
@@ -1427,7 +1747,102 @@ def _maybe_wrap_project_fields(
             )
         )
 
+    if wrapped and random.random() < 0.16:
+        scalar_subquery = _build_subquery_query(
+            schema,
+            target_kind="numeric",
+            stress_mode=stress_mode,
+            template=template,
+            force_single_row=True,
+        )
+        if scalar_subquery is not None:
+            wrapped.append(
+                SelectItem(
+                    expr=ScalarSubquery(scalar_subquery),
+                    alias=f"scalar_{len(wrapped)}",
+                )
+            )
+
+    if wrapped and random.random() < 0.16:
+        order_source = [
+            field
+            for field in wrapped
+            if isinstance(field, str) and (ctx.has_groupby or _field_is_numeric(ctx, field))
+        ]
+        if order_source:
+            base_field = random.choice(order_source)
+            wrapped.append(
+                SelectItem(
+                    expr=WindowExpr(
+                        func=random.choice(
+                            [
+                                WindowFunc.ROW_NUMBER,
+                                WindowFunc.RANK,
+                                WindowFunc.DENSE_RANK,
+                            ]
+                        ),
+                        partition_by=[],
+                        order_by=[OrderKey(base_field, descending=random.random() < 0.5)],
+                    ),
+                    alias=f"{_short_field_name(base_field)}_win",
+                )
+            )
+
     return _dedupe_projection_outputs(wrapped)
+
+
+def _maybe_wrap_with_derived_table(
+    node: QueryNode,
+    project_fields: List[object],
+    stress_mode: str = "balanced",
+    template: Optional[Dict[str, object]] = None,
+) -> Tuple[QueryNode, List[object]]:
+    if not isinstance(node, Project):
+        return node, project_fields
+    if not project_fields:
+        return node, project_fields
+    wrap_prob = 0.08
+    if stress_mode in ("subquery_heavy", "setop_heavy", "combo_heavy", "orderby_heavy", "orm_combo_heavy"):
+        wrap_prob = 0.18
+    if random.random() >= wrap_prob:
+        return node, project_fields
+
+    alias = "dt"
+    inner_project_fields, outer_fields = _prepare_derived_table_projection_fields(
+        project_fields,
+        alias,
+    )
+    inner_project = Project(fields=inner_project_fields, child=node.child)
+    derived = DerivedTable(subquery=inner_project, alias=alias)
+    return Project(fields=outer_fields, child=derived), outer_fields
+
+
+def _maybe_wrap_with_set_query(
+    node: QueryNode,
+    ctx: GenContext,
+    stress_mode: str = "balanced",
+    template: Optional[Dict[str, object]] = None,
+) -> QueryNode:
+    require_set = bool(template and template.get("require_set_query"))
+    if not require_set and stress_mode not in ("setop_heavy", "orm_combo_heavy", "combo_heavy"):
+        return node
+
+    wrap_prob = 0.22
+    if stress_mode == "setop_heavy":
+        wrap_prob = 0.78
+    elif stress_mode == "orm_combo_heavy":
+        wrap_prob = 0.55
+    elif stress_mode == "combo_heavy":
+        wrap_prob = 0.35
+
+    if not require_set and random.random() >= wrap_prob:
+        return node
+
+    branch = copy.deepcopy(node)
+    op = random.choice([SetOp.UNION, SetOp.INTERSECT, SetOp.EXCEPT])
+    use_all = op == SetOp.UNION and random.random() < 0.35
+    ctx.has_set_query = True
+    return SetQuery(left=node, right=branch, op=op, all=use_all)
 
 
 def _extend_projection(
@@ -1454,6 +1869,62 @@ def _dedupe_projection_outputs(fields: List[object]) -> List[object]:
         seen.add(name)
         result.append(field)
     return result
+
+
+def _prepare_derived_table_projection_fields(
+    project_fields: List[object],
+    derived_alias: str,
+) -> Tuple[List[object], List[str]]:
+    seen_labels = set()
+    inner_fields: List[object] = []
+    outer_fields: List[str] = []
+
+    for field in project_fields:
+        base_label = _projection_output_name(field).split(".", 1)[-1]
+        label = _next_derived_output_label(base_label, field, seen_labels)
+        seen_labels.add(label)
+
+        if isinstance(field, SelectItem):
+            if field.alias == label:
+                inner_field = field
+            else:
+                inner_field = SelectItem(expr=field.expr, alias=label)
+        elif label == base_label:
+            inner_field = field
+        else:
+            inner_field = SelectItem(expr=field, alias=label)
+
+        inner_fields.append(inner_field)
+        outer_fields.append(f"{derived_alias}.{label}")
+
+    return inner_fields, outer_fields
+
+
+def _next_derived_output_label(
+    base_label: str,
+    field: object,
+    seen_labels: set,
+) -> str:
+    if base_label not in seen_labels:
+        return base_label
+
+    preferred = _preferred_derived_collision_label(field)
+    if preferred and preferred not in seen_labels:
+        return preferred
+
+    suffix = 2
+    while True:
+        candidate = f"{base_label}_{suffix}"
+        if candidate not in seen_labels:
+            return candidate
+        suffix += 1
+
+
+def _preferred_derived_collision_label(field: object) -> Optional[str]:
+    if isinstance(field, str) and "." in field:
+        table_alias, col_name = field.split(".", 1)
+        return f"{table_alias}_{col_name}"
+    return None
 
 
 def _dedupe_keep_order(items: List[str]) -> List[str]:
@@ -1521,7 +1992,7 @@ def _get_preferred_group_fields(
     stress_mode: str,
     fallback_fields: List[str],
 ) -> List[str]:
-    if stress_mode in ("join_heavy", "null_heavy"):
+    if stress_mode in ("join_heavy", "relationship_heavy", "null_heavy", "loader_heavy"):
         right_fields = [f for f in _get_left_join_right_visible_cols(ctx) if f in fallback_fields]
         if right_fields and random.random() < 0.7:
             return right_fields
@@ -1562,7 +2033,7 @@ def _get_preferred_agg_cols(
     numeric_cols: List[str],
     fallback_fields: List[str],
 ) -> List[str]:
-    if stress_mode in ("join_heavy", "null_heavy"):
+    if stress_mode in ("join_heavy", "relationship_heavy", "null_heavy", "loader_heavy"):
         right_numeric_cols = _get_left_join_right_numeric_cols(ctx)
         if right_numeric_cols and random.random() < 0.75:
             return right_numeric_cols
@@ -1576,7 +2047,7 @@ def _choose_agg_func(
     template: Optional[Dict[str, object]] = None,
 ) -> AggFunc:
     if (
-        stress_mode in ("join_heavy", "null_heavy")
+        stress_mode in ("join_heavy", "relationship_heavy", "null_heavy", "loader_heavy")
         and "." in agg_col
         and agg_col.split(".", 1)[0] in ctx.left_join_right_aliases
         and random.random() < 0.75
@@ -1625,10 +2096,14 @@ def _choose_join_type(
     left_prob = 0.1
     if stress_mode == "join_heavy":
         left_prob = 0.35
+    elif stress_mode == "relationship_heavy":
+        left_prob = 0.42
     elif stress_mode == "null_heavy":
         left_prob = 0.6
     elif stress_mode == "groupby_heavy":
         left_prob = 0.2
+    elif stress_mode == "loader_heavy":
+        left_prob = 0.28
     return JoinType.LEFT if random.random() < left_prob else JoinType.INNER
 
 
@@ -1664,21 +2139,36 @@ def _should_apply_limit_offset(
     stress_mode: str,
     template: Optional[Dict[str, object]] = None,
 ) -> bool:
+    if template and template.get("force_limit_offset"):
+        return True
+
     limit_offset_prob = 0.06
     if stress_mode == "join_heavy":
         limit_offset_prob = 0.1
+    elif stress_mode == "relationship_heavy":
+        limit_offset_prob = 0.16
     elif stress_mode == "groupby_heavy":
         limit_offset_prob = 0.12
+    elif stress_mode == "entity_heavy":
+        limit_offset_prob = 0.18
     elif stress_mode == "duplicate_column_heavy":
         limit_offset_prob = 0.08
     elif stress_mode == "null_heavy":
         limit_offset_prob = 0.12
+    elif stress_mode == "self_join_heavy":
+        limit_offset_prob = 0.16
     elif stress_mode == "orderby_heavy":
         limit_offset_prob = 0.38
     elif stress_mode == "distinct_heavy":
         limit_offset_prob = 0.18
     elif stress_mode == "subquery_heavy":
         limit_offset_prob = 0.2
+    elif stress_mode == "setop_heavy":
+        limit_offset_prob = 0.16
+    elif stress_mode == "loader_heavy":
+        limit_offset_prob = 0.7
+    elif stress_mode == "orm_combo_heavy":
+        limit_offset_prob = 0.55
     elif stress_mode == "combo_heavy":
         limit_offset_prob = 0.75
 
@@ -1777,6 +2267,27 @@ def _apply_stress_mode(
             min(1.0, groupby_prob + 0.12),
             min(1.0, having_prob + 0.1),
         )
+    if stress_mode == "relationship_heavy":
+        return (
+            min(1.0, join_prob + 0.32),
+            min(1.0, filter_prob + 0.16),
+            min(1.0, groupby_prob + 0.14),
+            min(1.0, having_prob + 0.12),
+        )
+    if stress_mode == "entity_heavy":
+        return (
+            min(1.0, join_prob + 0.1),
+            min(1.0, filter_prob + 0.16),
+            groupby_prob,
+            having_prob,
+        )
+    if stress_mode == "self_join_heavy":
+        return (
+            min(1.0, join_prob + 0.18),
+            min(1.0, filter_prob + 0.16),
+            min(1.0, groupby_prob + 0.08),
+            having_prob,
+        )
     if stress_mode == "duplicate_column_heavy":
         return (
             min(1.0, join_prob + 0.22),
@@ -1819,6 +2330,27 @@ def _apply_stress_mode(
             min(1.0, groupby_prob + 0.12),
             min(1.0, having_prob + 0.08),
         )
+    if stress_mode == "setop_heavy":
+        return (
+            min(1.0, join_prob + 0.08),
+            min(1.0, filter_prob + 0.14),
+            min(1.0, groupby_prob + 0.08),
+            having_prob,
+        )
+    if stress_mode == "loader_heavy":
+        return (
+            min(1.0, join_prob + 0.18),
+            min(1.0, filter_prob + 0.18),
+            min(1.0, groupby_prob + 0.05),
+            having_prob,
+        )
+    if stress_mode == "orm_combo_heavy":
+        return (
+            min(1.0, join_prob + 0.3),
+            min(1.0, filter_prob + 0.24),
+            min(1.0, groupby_prob + 0.16),
+            min(1.0, having_prob + 0.12),
+        )
     if stress_mode == "combo_heavy":
         return (
             min(1.0, join_prob + 0.28),
@@ -1843,12 +2375,18 @@ if __name__ == "__main__":
     for mode in (
         "balanced",
         "join_heavy",
+        "relationship_heavy",
+        "entity_heavy",
+        "self_join_heavy",
         "groupby_heavy",
         "duplicate_column_heavy",
         "null_heavy",
         "orderby_heavy",
         "distinct_heavy",
         "subquery_heavy",
+        "setop_heavy",
+        "loader_heavy",
+        "orm_combo_heavy",
         "combo_heavy",
     ):
         ir, ctx = generate_ir(schema, stress_mode=mode, seed=7)
