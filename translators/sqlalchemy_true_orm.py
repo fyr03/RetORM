@@ -1,6 +1,7 @@
 """Path 3: true ORM execution with mapped classes and Session."""
 
 import os
+import random
 import sys
 from dataclasses import dataclass, field as dc_field
 from typing import Any, Dict, List, Optional, Tuple
@@ -15,6 +16,7 @@ from sqlalchemy import (
     case,
     except_,
     func,
+    inspect as sa_inspect,
     intersect,
     join,
     literal,
@@ -76,6 +78,34 @@ class UnsupportedTrueORM(Exception):
 
 
 @dataclass
+class TrueORMFacts:
+    entity_tables: Dict[str, str] = dc_field(default_factory=dict)
+    entity_pk_columns: Dict[str, Tuple[str, ...]] = dc_field(default_factory=dict)
+    entity_pks: Dict[str, List[Tuple[Any, ...]]] = dc_field(default_factory=dict)
+    duplicate_entity_pks: Dict[str, List[Tuple[Any, ...]]] = dc_field(default_factory=dict)
+    loaded_relationships: Dict[str, List[str]] = dc_field(default_factory=dict)
+    expected_loaded_relationships: Dict[str, List[str]] = dc_field(default_factory=dict)
+    identity_map_size: int = 0
+    materialized_entity_count: int = 0
+
+
+@dataclass
+class TrueORMResult:
+    rows: Rows
+    facts: TrueORMFacts
+    compiled_sql: str = ""
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        return self.rows[index]
+
+
+@dataclass
 class _QueryCtx:
     from_obj: Any
     aliases: Dict[str, Any]
@@ -105,9 +135,44 @@ class _SelectionMeta:
 
 _MODEL_CACHE: Dict[Tuple, Dict[str, Any]] = {}
 _CURRENT_MODELS: Dict[str, Any] = {}
+_COVERAGE_KEYS = (
+    "relationship_join_used",
+    "relationship_join_fallback",
+    "explicit_join_used",
+    "entity_projection_used",
+    "entity_materialization_used",
+    "entity_scalar_mix_used",
+    "joinedload_used",
+    "selectinload_used",
+    "relationship_touch_used",
+    "self_alias_used",
+    "set_query_used",
+    "scalar_subquery_used",
+    "window_expr_used",
+    "derived_table_used",
+    "limit_in_subquery_wrap_used",
+    "fault_injection_triggered",
+)
+_TRUE_ORM_COVERAGE: Dict[str, int] = {key: 0 for key in _COVERAGE_KEYS}
 
 
-def execute(ir: QueryNode, schema: Schema) -> Rows:
+def reset_true_orm_coverage() -> None:
+    for key in _COVERAGE_KEYS:
+        _TRUE_ORM_COVERAGE[key] = 0
+
+
+def get_true_orm_coverage_snapshot() -> Dict[str, int]:
+    return dict(_TRUE_ORM_COVERAGE)
+
+
+def _bump_coverage(key: str, amount: int = 1) -> None:
+    if not getattr(config, "TRUE_ORM_COVERAGE_ENABLED", True):
+        return
+    if key in _TRUE_ORM_COVERAGE:
+        _TRUE_ORM_COVERAGE[key] += amount
+
+
+def execute(ir: QueryNode, schema: Schema) -> TrueORMResult:
     from db.connector import get_session
 
     ok, reason = supports_true_orm(ir)
@@ -120,15 +185,22 @@ def execute(ir: QueryNode, schema: Schema) -> Rows:
     stmt, selection_meta = _build_query(ir, models, outer_aliases=None)
 
     with get_session() as session:
-        stmt, needs_unique = _apply_loader_options(stmt, selection_meta)
+        stmt, needs_unique, expected_loaded_relationships = _apply_loader_options(stmt, selection_meta)
+        compiled_sql = _maybe_sample_compiled_sql(stmt, session)
         result = session.execute(stmt)
         if needs_unique:
             result = result.unique()
         result_rows = result.all()
+        facts = _collect_true_orm_facts(
+            result_rows,
+            selection_meta,
+            session,
+            expected_loaded_relationships,
+        )
         flattened = [_flatten_result_row(row, selection_meta) for row in result_rows]
         if config.TRUE_ORM_TOUCH_RELATIONSHIPS:
             _touch_relationships(result_rows, selection_meta)
-        return flattened
+        return TrueORMResult(rows=flattened, facts=facts, compiled_sql=compiled_sql)
 
 
 def supports_true_orm(ir: QueryNode) -> Tuple[bool, str]:
@@ -151,6 +223,7 @@ def _build_query(
     allow_entity_projection: bool = True,
 ):
     if isinstance(root, SetQuery):
+        _bump_coverage("set_query_used")
         left_stmt, left_meta = _build_query(
             root.left,
             models,
@@ -208,8 +281,13 @@ def _build_query(
         )
     if spec.limit is not None:
         stmt = stmt.limit(max(0, spec.limit))
-        if spec.offset:
-            stmt = stmt.offset(max(0, spec.offset))
+        applied_offset = spec.offset
+        if _fault_mode() == "drop_offset":
+            applied_offset = 0
+            if spec.offset:
+                _bump_coverage("fault_injection_triggered")
+        if applied_offset:
+            stmt = stmt.offset(max(0, applied_offset))
     return stmt, selection_meta
 
 
@@ -370,11 +448,14 @@ def _build_rel_ctx(
 
     if isinstance(node, Scan):
         model_alias = aliased(models[node.table], name=node.alias)
+        if any(_entity_mapper_class(obj).__table__.name == node.table for obj in outer_aliases.values() if not hasattr(obj, "c")):
+            _bump_coverage("self_alias_used")
         aliases = dict(outer_aliases)
         aliases[node.alias] = model_alias
         return _QueryCtx(from_obj=model_alias, aliases=aliases)
 
     if isinstance(node, DerivedTable):
+        _bump_coverage("derived_table_used")
         sub_stmt, sub_meta = _build_query(
             node.subquery,
             models,
@@ -446,9 +527,18 @@ def _build_join_obj(node: Join, left: _QueryCtx, right: _QueryCtx, aliases, aggr
     if relationship_join is not None:
         return relationship_join
 
+    if config.TRUE_ORM_JOIN_MODE in ("relationship", "relationship_preferred"):
+        _bump_coverage("relationship_join_fallback")
+
     on_clause = _build_condition(node.on, aliases, aggregate_exprs)
+    if node.join_type == JoinType.LEFT and _fault_mode() == "inner_for_left_join":
+        _bump_coverage("fault_injection_triggered")
+        _bump_coverage("explicit_join_used")
+        return join(left.from_obj, right.from_obj, on_clause)
     if node.join_type == JoinType.LEFT:
+        _bump_coverage("explicit_join_used")
         return outerjoin(left.from_obj, right.from_obj, on_clause)
+    _bump_coverage("explicit_join_used")
     return join(left.from_obj, right.from_obj, on_clause)
 
 
@@ -476,6 +566,7 @@ def _try_relationship_join(node: Join, left: _QueryCtx, right: _QueryCtx):
         rel_attr = getattr(source_alias, rel_name)
         rel_target = rel_attr.of_type(target_alias)
         on_clause = rel_target.__clause_element__()
+        _bump_coverage("relationship_join_used")
         if node.join_type == JoinType.LEFT:
             return outerjoin(left.from_obj, right.from_obj, on_clause)
         return join(left.from_obj, right.from_obj, on_clause)
@@ -529,6 +620,8 @@ def _build_projection_items(fields, ctx: _QueryCtx, derived_labels: bool = False
             emitted_entity_aliases.add(entity_alias)
             entity = ctx.aliases[entity_alias]
             items.append(entity)
+            _bump_coverage("entity_projection_used")
+            _bump_coverage("entity_materialization_used")
             meta.append(
                 _SelectionMeta(
                     kind="entity",
@@ -550,6 +643,8 @@ def _build_projection_items(fields, ctx: _QueryCtx, derived_labels: bool = False
                 raise UnsupportedTrueORM("derived-table subqueries cannot project whole ORM entities")
             entity = ctx.aliases[field]
             items.append(entity)
+            _bump_coverage("entity_projection_used")
+            _bump_coverage("entity_materialization_used")
             meta.append(
                 _SelectionMeta(
                     kind="entity",
@@ -575,9 +670,13 @@ def _build_projection_items(fields, ctx: _QueryCtx, derived_labels: bool = False
         label = _next_projection_label(base_label, seen_labels)
         labeled = expr.label(label)
         items.append(labeled)
-        meta.append(_SelectionMeta(kind="scalar", output_name=label))
+        output_name = field if isinstance(field, str) and _is_derived_table_field(field, ctx.aliases) else label
+        meta.append(_SelectionMeta(kind="scalar", output_name=output_name))
         if isinstance(field, str):
             projection_aliases[field] = labeled
+
+    if any(item.kind == "entity" for item in meta) and any(item.kind == "scalar" for item in meta):
+        _bump_coverage("entity_scalar_mix_used")
 
     return items, meta, projection_aliases
 
@@ -590,13 +689,21 @@ def _build_order_key(key: OrderKey, aliases, aggregate_exprs, projection_aliases
         projection_aliases,
         resolve_unqualified_field=True,
     )
-    return expr.desc() if key.descending else expr.asc()
+    descending = key.descending
+    if _fault_mode() == "reverse_order":
+        descending = not descending
+        _bump_coverage("fault_injection_triggered")
+    return expr.desc() if descending else expr.asc()
 
 
 def _build_aggregate_expr(agg, aliases, aggregate_exprs):
     if agg.field == "*":
         if agg.func != AggFunc.COUNT:
             raise UnsupportedTrueORM(f"{agg.func.value}(*) is not supported")
+        return func.count()
+
+    if agg.func == AggFunc.COUNT and _fault_mode() == "count_star":
+        _bump_coverage("fault_injection_triggered")
         return func.count()
 
     value_expr = _resolve_expr(
@@ -629,6 +736,12 @@ def _build_condition(cond, aliases, aggregate_exprs, projection_aliases=None):
         )
         right = _resolve_expr(cond.value, aliases, aggregate_exprs, projection_aliases)
         if cond.value is None:
+            if _fault_mode() == "null_eq_false":
+                _bump_coverage("fault_injection_triggered")
+                if cond.op == CmpOp.EQ:
+                    return literal(False)
+                if cond.op == CmpOp.NEQ:
+                    return literal(True)
             if cond.op == CmpOp.EQ:
                 return left.is_(None)
             if cond.op == CmpOp.NEQ:
@@ -768,6 +881,7 @@ def _resolve_expr(
         return case(*whens, else_=else_expr)
 
     if isinstance(expr, ScalarSubquery):
+        _bump_coverage("scalar_subquery_used")
         sub_stmt, _ = _build_query(expr.subquery, _CURRENT_MODELS, outer_aliases=aliases)
         return sub_stmt.scalar_subquery()
 
@@ -778,6 +892,7 @@ def _resolve_expr(
 
 
 def _build_window_expr(expr: WindowExpr, aliases, aggregate_exprs, projection_aliases):
+    _bump_coverage("window_expr_used")
     if expr.func in {WindowFunc.ROW_NUMBER, WindowFunc.RANK, WindowFunc.DENSE_RANK}:
         base = getattr(func, expr.func.value.lower())()
     else:
@@ -826,6 +941,7 @@ def _wrap_in_subquery_if_needed(node: QueryNode, sub_stmt):
     if not _query_has_limit_offset(node):
         return sub_stmt
 
+    _bump_coverage("limit_in_subquery_wrap_used")
     derived = sub_stmt.subquery("retorm_in_subq")
     columns = list(derived.c)
     if len(columns) != 1:
@@ -934,9 +1050,10 @@ def _flatten_result_row(row, selection_meta: List[_SelectionMeta]) -> Row:
 def _apply_loader_options(stmt, selection_meta):
     strategy = getattr(config, "TRUE_ORM_LOADER_STRATEGY", "off")
     if strategy == "off":
-        return stmt, False
+        return stmt, False, {}
     options = []
     needs_unique = False
+    expected_loaded_relationships: Dict[str, List[str]] = {}
     for meta in selection_meta:
         if meta.kind != "entity" or meta.entity_ref is None:
             continue
@@ -946,6 +1063,7 @@ def _apply_loader_options(stmt, selection_meta):
         for rel_name in rel_names[:1]:
             rel_attr = getattr(entity_root, rel_name)
             rel_prop = getattr(rel_attr, "property", None)
+            expected_loaded_relationships.setdefault(meta.alias_name or meta.output_name, []).append(rel_name)
             if strategy == "joined":
                 # `joinedload()` over collection relationships forces ORM-level
                 # row de-duplication, which changes the SQL row multiplicity we
@@ -954,13 +1072,99 @@ def _apply_loader_options(stmt, selection_meta):
                 # query result shape stays comparable to raw SQL.
                 if rel_prop is not None and getattr(rel_prop, "uselist", False):
                     options.append(Load(entity_root).selectinload(rel_attr))
+                    _bump_coverage("selectinload_used")
                 else:
                     options.append(Load(entity_root).joinedload(rel_attr))
+                    _bump_coverage("joinedload_used")
             elif strategy == "selectin":
                 options.append(Load(entity_root).selectinload(rel_attr))
+                _bump_coverage("selectinload_used")
     if options:
         stmt = stmt.options(*options)
-    return stmt, needs_unique
+    return stmt, needs_unique, {
+        alias_name: sorted(set(rel_names))
+        for alias_name, rel_names in expected_loaded_relationships.items()
+    }
+
+
+def _collect_true_orm_facts(
+    result_rows,
+    selection_meta: List[_SelectionMeta],
+    session,
+    expected_loaded_relationships: Dict[str, List[str]],
+) -> TrueORMFacts:
+    facts = TrueORMFacts(
+        expected_loaded_relationships={
+            alias_name: list(rel_names)
+            for alias_name, rel_names in expected_loaded_relationships.items()
+        },
+        identity_map_size=len(session.identity_map),
+    )
+    duplicate_lists: Dict[str, List[Tuple[Any, ...]]] = {}
+
+    for meta in selection_meta:
+        if meta.kind != "entity":
+            continue
+        alias_name = meta.alias_name or meta.output_name
+        entity_cls = meta.entity_cls
+        pk_cols = tuple(col.name for col in entity_cls.__table__.primary_key.columns)
+        facts.entity_tables.setdefault(alias_name, entity_cls.__table__.name)
+        facts.entity_pk_columns.setdefault(alias_name, pk_cols)
+
+    for row in result_rows:
+        for idx, meta in enumerate(selection_meta):
+            if meta.kind != "entity":
+                continue
+            alias_name = meta.alias_name or meta.output_name
+            entity_cls = meta.entity_cls
+            value = row[idx]
+            pk_cols = facts.entity_pk_columns[alias_name]
+            if value is None:
+                continue
+
+            facts.materialized_entity_count += 1
+            pk_tuple = tuple(getattr(value, col_name) for col_name in pk_cols)
+            seen = facts.entity_pks.setdefault(alias_name, [])
+            if pk_tuple in seen:
+                duplicate_lists.setdefault(alias_name, []).append(pk_tuple)
+            seen.append(pk_tuple)
+            loaded = facts.loaded_relationships.setdefault(alias_name, [])
+            loaded.extend(_loaded_relationship_names(value, entity_cls))
+
+    for alias_name, duplicates in duplicate_lists.items():
+        facts.duplicate_entity_pks[alias_name] = duplicates.copy()
+
+    for alias_name, rel_names in list(facts.loaded_relationships.items()):
+        facts.loaded_relationships[alias_name] = sorted(set(rel_names))
+
+    return facts
+
+
+def _loaded_relationship_names(entity_obj, entity_cls) -> List[str]:
+    state = sa_inspect(entity_obj)
+    unloaded = set(getattr(state, "unloaded", set()) or set())
+    rel_names = list(getattr(entity_cls, "__retorm_relationships__", {}).keys())
+    return [rel_name for rel_name in rel_names if rel_name not in unloaded]
+
+
+def _maybe_sample_compiled_sql(stmt, session) -> str:
+    rate = max(0.0, float(getattr(config, "TRUE_ORM_SQL_SAMPLE_RATE", 0.0) or 0.0))
+    if rate <= 0.0 or random.random() > rate:
+        return ""
+    bind = session.get_bind()
+    if bind is not None:
+        compiled = stmt.compile(
+            dialect=bind.dialect,
+            compile_kwargs={"literal_binds": True},
+        )
+    else:
+        compiled = stmt.compile(compile_kwargs={"literal_binds": True})
+    return str(compiled)
+
+
+def _fault_mode() -> str:
+    mode = getattr(config, "TRUE_ORM_FAULT_INJECTION", "off")
+    return mode or "off"
 
 
 def _touch_relationships(result_rows, selection_meta):
@@ -972,6 +1176,7 @@ def _touch_relationships(result_rows, selection_meta):
             if value is None:
                 continue
             for rel_name in getattr(meta.entity_cls, "__retorm_relationships__", {}).keys():
+                _bump_coverage("relationship_touch_used")
                 getattr(value, rel_name, None)
 
 
@@ -1045,8 +1250,27 @@ def _get_models(schema: Schema) -> Dict[str, Any]:
             ref_cls = models[fk.ref_table]
             rel_name = _unique_attr_name(src_cls, fk.ref_table.rstrip("s") or fk.ref_table, idx)
             back_name = _unique_attr_name(ref_cls, f"{table.name}_collection", idx)
-            setattr(src_cls, rel_name, relationship(ref_cls, foreign_keys=[getattr(src_cls, fk.src_col)], back_populates=back_name))
-            setattr(ref_cls, back_name, relationship(src_cls, foreign_keys=[getattr(src_cls, fk.src_col)], back_populates=rel_name))
+            fk_attr = getattr(src_cls, fk.src_col)
+            ref_pk_attr = getattr(ref_cls, fk.ref_col)
+            rel_kwargs = {
+                "foreign_keys": [fk_attr],
+                "back_populates": back_name,
+            }
+            if src_cls is ref_cls:
+                # Self-referential FKs need remote_side so SQLAlchemy can keep
+                # the parent link as many-to-one and the collection side as
+                # one-to-many.
+                rel_kwargs["remote_side"] = [ref_pk_attr]
+            setattr(src_cls, rel_name, relationship(ref_cls, **rel_kwargs))
+            setattr(
+                ref_cls,
+                back_name,
+                relationship(
+                    src_cls,
+                    foreign_keys=[fk_attr],
+                    back_populates=rel_name,
+                ),
+            )
             src_cls.__retorm_relationships__[rel_name] = {
                 "source_col": fk.src_col,
                 "target_table": fk.ref_table,

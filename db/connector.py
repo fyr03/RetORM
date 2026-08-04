@@ -1,6 +1,7 @@
 """MySQL connection helpers for RetORM."""
 
 import sys
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
 import pymysql
@@ -33,14 +34,36 @@ def get_connection() -> pymysql.connections.Connection:
 def execute_sql(sql: str, params=None) -> List[Dict[str, Any]]:
     conn = get_connection()
     try:
-        with conn.cursor() as cursor:
+        # Use a plain tuple cursor here so duplicate projection labels are not
+        # silently collapsed by DictCursor before the comparator sees them.
+        with conn.cursor(pymysql.cursors.Cursor) as cursor:
             if params is None:
                 cursor.execute(sql)
             else:
                 cursor.execute(sql, params)
-            return list(cursor.fetchall())
+            if cursor.description is None:
+                return []
+            raw_names = [col[0] for col in cursor.description]
+            names = _dedupe_column_names(raw_names)
+            rows = []
+            for values in cursor.fetchall():
+                rows.append({name: value for name, value in zip(names, values)})
+            return rows
     finally:
         conn.close()
+
+
+def _dedupe_column_names(names: List[str]) -> List[str]:
+    seen: Dict[str, int] = {}
+    totals = Counter(names)
+    result: List[str] = []
+    for name in names:
+        seen[name] = seen.get(name, 0) + 1
+        if totals[name] == 1:
+            result.append(name)
+        else:
+            result.append(f"{name}__dup{seen[name]}")
+    return result
 
 
 def execute_many(sql: str, data: List[tuple]) -> None:

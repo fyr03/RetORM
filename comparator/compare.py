@@ -54,7 +54,10 @@ class AggFloat(float):
     """
 
 
-_ALIAS_PREFIX_RE = re.compile(r"^([a-zA-Z]\d*)_(.+)$")
+# Generated scan/join/derived aliases are short lowercase names like `u`, `u2`,
+# `ps`, `dt`; preserve semantic aliases such as `avg_u_price` or `sum_total`.
+_ALIAS_PREFIX_RE = re.compile(r"^([a-z]{1,2}\d*)_(.+)$")
+_DUP_SUFFIX_RE = re.compile(r"__dup\d+$")
 
 
 def compare_all(
@@ -62,13 +65,14 @@ def compare_all(
     sql_rows: Rows,
     orm_rows: Rows,
     ordered: bool = False,
+    strict: bool = False,
 ) -> Tuple[CompareResult, CompareResult]:
-    norm_ref = normalize(ref_rows)
-    norm_sql = normalize(sql_rows)
-    norm_orm = normalize(orm_rows)
+    norm_ref = normalize(ref_rows, strict=strict)
+    norm_sql = normalize(sql_rows, strict=strict)
+    norm_orm = normalize(orm_rows, strict=strict)
 
-    ref_vs_sql = _compare_two(norm_ref, norm_sql, ordered, "ref", "sql")
-    ref_vs_orm = _compare_two(norm_ref, norm_orm, ordered, "ref", "orm")
+    ref_vs_sql = _compare_two(norm_ref, norm_sql, ordered, "ref", "sql", strict=strict)
+    ref_vs_orm = _compare_two(norm_ref, norm_orm, ordered, "ref", "orm", strict=strict)
     return ref_vs_sql, ref_vs_orm
 
 
@@ -78,21 +82,22 @@ def compare_two_paths(
     name_a: str = "A",
     name_b: str = "B",
     ordered: bool = False,
+    strict: bool = False,
 ) -> CompareResult:
-    norm_a = normalize(rows_a)
-    norm_b = normalize(rows_b)
-    return _compare_two(norm_a, norm_b, ordered, name_a, name_b)
+    norm_a = normalize(rows_a, strict=strict)
+    norm_b = normalize(rows_b, strict=strict)
+    return _compare_two(norm_a, norm_b, ordered, name_a, name_b, strict=strict)
 
 
-def normalize(rows: Rows) -> NormRows:
-    return [_normalize_row(row) for row in rows]
+def normalize(rows: Rows, strict: bool = False) -> NormRows:
+    return [_normalize_row(row, strict=strict) for row in rows]
 
 
-def _normalize_row(row: Row) -> NormRow:
+def _normalize_row(row: Row, strict: bool = False) -> NormRow:
     norm_keys_in_order: List[str] = []
     norm_key_count: Dict[str, int] = {}
     for key in row.keys():
-        norm_key = _normalize_key(key)
+        norm_key = _normalize_key(key, strict=strict)
         norm_keys_in_order.append(norm_key)
         norm_key_count[norm_key] = norm_key_count.get(norm_key, 0) + 1
 
@@ -109,7 +114,12 @@ def _normalize_row(row: Row) -> NormRow:
     return result
 
 
-def _normalize_key(key: str) -> str:
+def _normalize_key(key: str, strict: bool = False) -> str:
+    if strict:
+        return key
+
+    key = _DUP_SUFFIX_RE.sub("", key)
+
     if "." in key:
         return key.split(".", 1)[1]
 
@@ -139,7 +149,11 @@ def _compare_two(
     ordered: bool,
     name_a: str,
     name_b: str,
+    strict: bool = False,
 ) -> CompareResult:
+    if strict:
+        ordered = True
+
     if len(norm_a) != len(norm_b):
         return CompareResult(
             match=False,

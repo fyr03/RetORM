@@ -90,6 +90,21 @@ def generate_ir(
         if stress_mode != "balanced"
         else 2
     )
+    if stress_mode in (
+        "relationship_heavy",
+        "relationship_orderby_heavy",
+        "entity_heavy",
+        "entity_dedup_heavy",
+        "distinct_entity_heavy",
+        "limit_joined_entity_heavy",
+        "loader_heavy",
+        "loader_strategy_heavy",
+        "derived_heavy",
+        "window_heavy",
+        "orm_combo_heavy",
+        "combo_heavy",
+    ):
+        retry_budget = max(retry_budget, 18)
 
     last_result = None
     for attempt in range(retry_budget):
@@ -230,6 +245,8 @@ def _generate_ir_once(
             node = _attach_filter_condition(node, subquery_cond)
 
     effective_groupby_prob = min(1.0, groupby_prob + 0.2) if join_step else groupby_prob
+    if template.get("require_entity_projection") and not template.get("require_groupby"):
+        effective_groupby_prob = min(effective_groupby_prob, 0.06)
     should_groupby = bool(template.get("require_groupby"))
     if not should_groupby:
         should_groupby = bool(ctx.visible_cols) and random.random() < effective_groupby_prob
@@ -371,6 +388,9 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
         "prefer_entity_scalar_mix": False,
         "require_self_join": False,
         "require_set_query": False,
+        "prefer_derived_table": False,
+        "force_scalar_subquery": False,
+        "force_window_expr": False,
         "predicate_depth": 2,
         "max_group_fields": 2,
         "max_project_fields": 4,
@@ -474,6 +494,33 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
                 "max_project_fields": 5,
             }
         )
+    elif stress_mode == "derived_heavy":
+        template.update(
+            {
+                "target_joins": 1 if can_join else 0,
+                "require_filter": True,
+                "require_orderby": True,
+                "require_subquery": True,
+                "prefer_derived_table": True,
+                "force_scalar_subquery": True,
+                "predicate_depth": 3,
+                "max_project_fields": 5,
+            }
+        )
+    elif stress_mode == "window_heavy":
+        template.update(
+            {
+                "target_joins": 1 if can_join else 0,
+                "require_filter": True,
+                "require_orderby": True,
+                "force_window_expr": True,
+                "prefer_orderby_agg": True,
+                "min_aggs": 1,
+                "max_aggs": 2,
+                "predicate_depth": 3,
+                "max_project_fields": 5,
+            }
+        )
     elif stress_mode == "relationship_heavy":
         template.update(
             {
@@ -481,6 +528,8 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
                 "require_filter": True,
                 "require_orderby": True,
                 "force_right_projection": can_join,
+                "require_entity_projection": can_join,
+                "prefer_entity_scalar_mix": can_join,
                 "prefer_sparse_projection": False,
                 "min_aggs": 1,
                 "max_aggs": 2,
@@ -538,8 +587,77 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
                 "require_entity_projection": True,
                 "prefer_entity_scalar_mix": True,
                 "force_limit_offset": True,
+                "force_left_join": bool(ref_tables),
                 "predicate_depth": 3,
                 "max_project_fields": 5,
+            }
+        )
+    elif stress_mode == "relationship_orderby_heavy":
+        template.update(
+            {
+                "target_joins": 2 if can_multi_join else (1 if can_join else 0),
+                "require_filter": True,
+                "require_orderby": True,
+                "force_right_projection": can_join,
+                "require_entity_projection": can_join,
+                "prefer_entity_scalar_mix": can_join,
+                "force_window_expr": True,
+                "prefer_orderby_agg": False,
+                "predicate_depth": 3,
+                "max_project_fields": 5,
+            }
+        )
+    elif stress_mode == "entity_dedup_heavy":
+        template.update(
+            {
+                "target_joins": 2 if can_multi_join else (1 if can_join else 0),
+                "require_filter": True,
+                "require_orderby": True,
+                "require_entity_projection": True,
+                "prefer_entity_scalar_mix": False,
+                "predicate_depth": 3,
+                "max_project_fields": 6,
+            }
+        )
+    elif stress_mode == "distinct_entity_heavy":
+        template.update(
+            {
+                "target_joins": 1 if can_join else 0,
+                "require_filter": True,
+                "require_orderby": True,
+                "require_distinct": True,
+                "require_entity_projection": True,
+                "prefer_entity_scalar_mix": True,
+                "force_limit_offset": True,
+                "predicate_depth": 3,
+                "max_project_fields": 6,
+            }
+        )
+    elif stress_mode == "limit_joined_entity_heavy":
+        template.update(
+            {
+                "target_joins": 2 if can_multi_join else (1 if can_join else 0),
+                "require_filter": True,
+                "require_orderby": True,
+                "require_entity_projection": True,
+                "prefer_entity_scalar_mix": True,
+                "force_limit_offset": True,
+                "predicate_depth": 3,
+                "max_project_fields": 6,
+            }
+        )
+    elif stress_mode == "loader_strategy_heavy":
+        template.update(
+            {
+                "target_joins": 2 if can_multi_join else (1 if can_join else 0),
+                "require_filter": True,
+                "require_orderby": True,
+                "require_entity_projection": True,
+                "prefer_entity_scalar_mix": True,
+                "force_limit_offset": True,
+                "force_left_join": bool(ref_tables),
+                "predicate_depth": 4,
+                "max_project_fields": 6,
             }
         )
     elif stress_mode == "orm_combo_heavy":
@@ -552,6 +670,9 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
                 "prefer_entity_scalar_mix": True,
                 "require_set_query": True,
                 "require_self_join": bool(schema.tables),
+                "prefer_derived_table": True,
+                "force_scalar_subquery": True,
+                "force_window_expr": True,
                 "predicate_depth": 4,
                 "max_project_fields": 6,
             }
@@ -574,6 +695,9 @@ def _build_stress_template(schema: Schema, stress_mode: str) -> Dict[str, object
                 "force_right_projection": can_join,
                 "require_self_join": len(schema.tables) >= 1,
                 "require_set_query": True,
+                "prefer_derived_table": True,
+                "force_scalar_subquery": True,
+                "force_window_expr": True,
                 "prefer_orderby_agg": True,
                 "min_aggs": 2,
                 "max_aggs": 3,
@@ -660,6 +784,10 @@ def _ir_satisfies_stress_mode(
         return features["has_distinct"]
     if stress_mode == "subquery_heavy":
         return features["has_subquery"] and features["has_orderby"]
+    if stress_mode == "derived_heavy":
+        return features["has_derived_table"] and features["has_subquery"]
+    if stress_mode == "window_heavy":
+        return features["has_window_expr"] and features["has_orderby"]
     if stress_mode == "combo_heavy":
         return (
             features["has_subquery"]
@@ -829,7 +957,7 @@ def _choose_main_table(
         if candidates:
             return random.choice(candidates)
 
-    if stress_mode in ("join_heavy", "relationship_heavy", "groupby_heavy", "duplicate_column_heavy", "subquery_heavy", "combo_heavy", "orm_combo_heavy", "self_join_heavy", "entity_heavy", "setop_heavy", "loader_heavy"):
+    if stress_mode in ("join_heavy", "relationship_heavy", "relationship_orderby_heavy", "groupby_heavy", "duplicate_column_heavy", "subquery_heavy", "combo_heavy", "orm_combo_heavy", "self_join_heavy", "entity_heavy", "entity_dedup_heavy", "distinct_entity_heavy", "limit_joined_entity_heavy", "setop_heavy", "loader_heavy", "loader_strategy_heavy"):
         scored = []
         for table in schema.tables:
             degree = 0
@@ -982,7 +1110,7 @@ def _maybe_promote_entity_projection_fields(
         return fields
 
     require_entity = bool(template and template.get("require_entity_projection"))
-    if not require_entity and stress_mode not in ("entity_heavy", "loader_heavy", "orm_combo_heavy"):
+    if not require_entity and stress_mode not in ("entity_heavy", "entity_dedup_heavy", "distinct_entity_heavy", "limit_joined_entity_heavy", "loader_heavy", "loader_strategy_heavy", "orm_combo_heavy"):
         return fields
 
     alias = _choose_entity_projection_alias(ctx, fields)
@@ -1612,7 +1740,7 @@ def _generate_having_condition(
         return Compare(alias_name, random.choice([CmpOp.EQ, CmpOp.NEQ]), None)
 
     alias_name = random.choice(ctx.agg_aliases)
-    if stress_mode in ("join_heavy", "relationship_heavy", "null_heavy", "loader_heavy") and random.random() < 0.22:
+    if stress_mode in ("join_heavy", "relationship_heavy", "relationship_orderby_heavy", "null_heavy", "loader_heavy", "loader_strategy_heavy", "limit_joined_entity_heavy") and random.random() < 0.22:
         return Compare(alias_name, random.choice([CmpOp.EQ, CmpOp.NEQ]), None)
     op = random.choice([CmpOp.GT, CmpOp.GTE, CmpOp.LT, CmpOp.LTE])
     val = random.randint(0, 200)
@@ -1673,13 +1801,13 @@ def _choose_project_fields(
         duplicate_prob = 0.9
     elif stress_mode == "join_heavy":
         duplicate_prob = 0.6
-    elif stress_mode == "entity_heavy":
+    elif stress_mode in ("entity_heavy", "entity_dedup_heavy", "distinct_entity_heavy", "limit_joined_entity_heavy", "loader_strategy_heavy"):
         duplicate_prob = 0.3
 
     if duplicate_fields and random.random() < duplicate_prob:
         return _extend_projection(candidates, duplicate_fields, extra_limit=2)
 
-    if stress_mode in ("join_heavy", "relationship_heavy", "null_heavy", "loader_heavy") and right_fields and random.random() < 0.7:
+    if stress_mode in ("join_heavy", "relationship_heavy", "relationship_orderby_heavy", "null_heavy", "loader_heavy", "loader_strategy_heavy", "limit_joined_entity_heavy") and right_fields and random.random() < 0.7:
         chosen = random.sample(right_fields, random.randint(1, len(right_fields)))
         return _extend_projection(candidates, chosen, extra_limit=2)
 
@@ -1747,7 +1875,10 @@ def _maybe_wrap_project_fields(
             )
         )
 
-    if wrapped and random.random() < 0.16:
+    scalar_subquery_prob = 0.16
+    if template and template.get("force_scalar_subquery"):
+        scalar_subquery_prob = 0.55
+    if wrapped and random.random() < scalar_subquery_prob:
         scalar_subquery = _build_subquery_query(
             schema,
             target_kind="numeric",
@@ -1763,7 +1894,10 @@ def _maybe_wrap_project_fields(
                 )
             )
 
-    if wrapped and random.random() < 0.16:
+    window_prob = 0.16
+    if template and template.get("force_window_expr"):
+        window_prob = 0.55
+    if wrapped and random.random() < window_prob:
         order_source = [
             field
             for field in wrapped
@@ -1804,6 +1938,8 @@ def _maybe_wrap_with_derived_table(
     wrap_prob = 0.08
     if stress_mode in ("subquery_heavy", "setop_heavy", "combo_heavy", "orderby_heavy", "orm_combo_heavy"):
         wrap_prob = 0.18
+    if template and template.get("prefer_derived_table"):
+        wrap_prob = max(wrap_prob, 0.38)
     if random.random() >= wrap_prob:
         return node, project_fields
 
@@ -2033,7 +2169,7 @@ def _get_preferred_agg_cols(
     numeric_cols: List[str],
     fallback_fields: List[str],
 ) -> List[str]:
-    if stress_mode in ("join_heavy", "relationship_heavy", "null_heavy", "loader_heavy"):
+    if stress_mode in ("join_heavy", "relationship_heavy", "relationship_orderby_heavy", "null_heavy", "loader_heavy", "loader_strategy_heavy", "limit_joined_entity_heavy"):
         right_numeric_cols = _get_left_join_right_numeric_cols(ctx)
         if right_numeric_cols and random.random() < 0.75:
             return right_numeric_cols
@@ -2047,7 +2183,7 @@ def _choose_agg_func(
     template: Optional[Dict[str, object]] = None,
 ) -> AggFunc:
     if (
-        stress_mode in ("join_heavy", "relationship_heavy", "null_heavy", "loader_heavy")
+        stress_mode in ("join_heavy", "relationship_heavy", "relationship_orderby_heavy", "null_heavy", "loader_heavy", "loader_strategy_heavy", "limit_joined_entity_heavy")
         and "." in agg_col
         and agg_col.split(".", 1)[0] in ctx.left_join_right_aliases
         and random.random() < 0.75
@@ -2098,12 +2234,16 @@ def _choose_join_type(
         left_prob = 0.35
     elif stress_mode == "relationship_heavy":
         left_prob = 0.42
+    elif stress_mode == "relationship_orderby_heavy":
+        left_prob = 0.46
     elif stress_mode == "null_heavy":
         left_prob = 0.6
     elif stress_mode == "groupby_heavy":
         left_prob = 0.2
     elif stress_mode == "loader_heavy":
         left_prob = 0.28
+    elif stress_mode in ("entity_dedup_heavy", "distinct_entity_heavy", "limit_joined_entity_heavy", "loader_strategy_heavy"):
+        left_prob = 0.32
     return JoinType.LEFT if random.random() < left_prob else JoinType.INNER
 
 
@@ -2129,6 +2269,8 @@ def _should_apply_distinct(
         distinct_prob = 0.9
     elif stress_mode == "subquery_heavy":
         distinct_prob = 0.2
+    elif stress_mode == "distinct_entity_heavy":
+        distinct_prob = 0.88
     elif stress_mode == "combo_heavy":
         distinct_prob = 0.85
 
@@ -2147,10 +2289,16 @@ def _should_apply_limit_offset(
         limit_offset_prob = 0.1
     elif stress_mode == "relationship_heavy":
         limit_offset_prob = 0.16
+    elif stress_mode == "relationship_orderby_heavy":
+        limit_offset_prob = 0.26
     elif stress_mode == "groupby_heavy":
         limit_offset_prob = 0.12
     elif stress_mode == "entity_heavy":
         limit_offset_prob = 0.18
+    elif stress_mode == "entity_dedup_heavy":
+        limit_offset_prob = 0.24
+    elif stress_mode == "distinct_entity_heavy":
+        limit_offset_prob = 0.72
     elif stress_mode == "duplicate_column_heavy":
         limit_offset_prob = 0.08
     elif stress_mode == "null_heavy":
@@ -2167,6 +2315,10 @@ def _should_apply_limit_offset(
         limit_offset_prob = 0.16
     elif stress_mode == "loader_heavy":
         limit_offset_prob = 0.7
+    elif stress_mode == "limit_joined_entity_heavy":
+        limit_offset_prob = 0.86
+    elif stress_mode == "loader_strategy_heavy":
+        limit_offset_prob = 0.82
     elif stress_mode == "orm_combo_heavy":
         limit_offset_prob = 0.55
     elif stress_mode == "combo_heavy":
@@ -2205,6 +2357,10 @@ def _choose_orderby_keys(
             orderby_prob = 0.65
         elif stress_mode == "subquery_heavy":
             orderby_prob = 0.72
+        elif stress_mode == "relationship_orderby_heavy":
+            orderby_prob = 0.95
+        elif stress_mode in ("entity_dedup_heavy", "distinct_entity_heavy", "limit_joined_entity_heavy", "loader_heavy", "loader_strategy_heavy", "orm_combo_heavy"):
+            orderby_prob = 0.8
         elif stress_mode == "combo_heavy":
             orderby_prob = 0.95
         should_orderby = random.random() < orderby_prob
@@ -2232,7 +2388,7 @@ def _choose_orderby_keys(
         other_fields = [field for field in unique_fields if field not in agg_fields]
         ordered_fields.extend(agg_fields)
         ordered_fields.extend(other_fields)
-    elif stress_mode in ("join_heavy", "null_heavy", "orderby_heavy"):
+    elif stress_mode in ("join_heavy", "null_heavy", "orderby_heavy", "relationship_orderby_heavy", "limit_joined_entity_heavy"):
         right_fields = [
             field
             for field in unique_fields
@@ -2274,9 +2430,30 @@ def _apply_stress_mode(
             min(1.0, groupby_prob + 0.14),
             min(1.0, having_prob + 0.12),
         )
+    if stress_mode == "relationship_orderby_heavy":
+        return (
+            min(1.0, join_prob + 0.34),
+            min(1.0, filter_prob + 0.18),
+            min(1.0, groupby_prob + 0.08),
+            having_prob,
+        )
     if stress_mode == "entity_heavy":
         return (
             min(1.0, join_prob + 0.1),
+            min(1.0, filter_prob + 0.16),
+            groupby_prob,
+            having_prob,
+        )
+    if stress_mode == "entity_dedup_heavy":
+        return (
+            min(1.0, join_prob + 0.2),
+            min(1.0, filter_prob + 0.18),
+            min(1.0, groupby_prob + 0.04),
+            having_prob,
+        )
+    if stress_mode == "distinct_entity_heavy":
+        return (
+            min(1.0, join_prob + 0.14),
             min(1.0, filter_prob + 0.16),
             groupby_prob,
             having_prob,
@@ -2330,6 +2507,20 @@ def _apply_stress_mode(
             min(1.0, groupby_prob + 0.12),
             min(1.0, having_prob + 0.08),
         )
+    if stress_mode == "derived_heavy":
+        return (
+            min(1.0, join_prob + 0.14),
+            min(1.0, filter_prob + 0.18),
+            min(1.0, groupby_prob + 0.08),
+            min(1.0, having_prob + 0.06),
+        )
+    if stress_mode == "window_heavy":
+        return (
+            min(1.0, join_prob + 0.12),
+            min(1.0, filter_prob + 0.16),
+            min(1.0, groupby_prob + 0.16),
+            min(1.0, having_prob + 0.08),
+        )
     if stress_mode == "setop_heavy":
         return (
             min(1.0, join_prob + 0.08),
@@ -2341,6 +2532,20 @@ def _apply_stress_mode(
         return (
             min(1.0, join_prob + 0.18),
             min(1.0, filter_prob + 0.18),
+            min(1.0, groupby_prob + 0.05),
+            having_prob,
+        )
+    if stress_mode == "limit_joined_entity_heavy":
+        return (
+            min(1.0, join_prob + 0.22),
+            min(1.0, filter_prob + 0.18),
+            min(1.0, groupby_prob + 0.04),
+            having_prob,
+        )
+    if stress_mode == "loader_strategy_heavy":
+        return (
+            min(1.0, join_prob + 0.24),
+            min(1.0, filter_prob + 0.2),
             min(1.0, groupby_prob + 0.05),
             having_prob,
         )
@@ -2384,6 +2589,8 @@ if __name__ == "__main__":
         "orderby_heavy",
         "distinct_heavy",
         "subquery_heavy",
+        "derived_heavy",
+        "window_heavy",
         "setop_heavy",
         "loader_heavy",
         "orm_combo_heavy",

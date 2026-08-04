@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 from enum import Enum
 
+import config
 
 # ---------------------------------------------------------------------------
 # 数据类型定义
@@ -137,12 +138,12 @@ def generate_schema(
         # 第一张表没有外键；后续表以 fk_prob 概率引用前面某张表
         if i > 0 and random.random() < fk_prob:
             ref_table = random.choice(tables)   # 引用已生成的表
-            fk_col_name = f"{ref_table.name}_id"
+            fk_col_name = _unique_col_name(columns, f"{ref_table.name}_id")
             # 外键列：INT NOT NULL
             fk_col = Column(
                 name=fk_col_name,
                 col_type=ColType.INT,
-                nullable=False,
+                nullable=(random.random() < config.SCHEMA_NULLABLE_FK_PROB),
             )
             columns.append(fk_col)
             fks.append(ForeignKey(
@@ -154,6 +155,7 @@ def generate_schema(
 
         tables.append(TableSchema(name=tname, columns=columns, fks=fks))
 
+    _add_extra_schema_shapes(tables)
     return Schema(tables=tables)
 
 
@@ -185,6 +187,132 @@ def _generate_columns(
         ))
 
     return columns
+
+
+def _add_extra_schema_shapes(tables: List[TableSchema]) -> None:
+    if not tables:
+        return
+
+    for idx, table in enumerate(tables):
+        prior_tables = tables[:idx]
+        if prior_tables and random.random() < config.SCHEMA_EXTRA_FK_PROB:
+            ref_table = random.choice(prior_tables)
+            _append_fk_column(
+                table,
+                ref_table.name,
+                nullable=(random.random() < config.SCHEMA_NULLABLE_FK_PROB),
+            )
+            if random.random() < config.SCHEMA_MULTI_FK_SAME_TARGET_PROB:
+                _append_fk_column(
+                    table,
+                    ref_table.name,
+                    base_name=f"{ref_table.name}_alt_id",
+                    nullable=(random.random() < config.SCHEMA_NULLABLE_FK_PROB),
+                )
+
+        if random.random() < config.SCHEMA_SELF_FK_PROB:
+            _append_fk_column(
+                table,
+                table.name,
+                base_name=f"{table.name}_parent_id",
+                nullable=True,
+            )
+
+    if len(tables) >= 3 and random.random() < config.SCHEMA_ASSOC_TABLE_PROB:
+        assoc_table = random.choice(tables[1:])
+        other_tables = [table for table in tables if table.name != assoc_table.name]
+        if len(other_tables) >= 2:
+            left_table, right_table = random.sample(other_tables, 2)
+            _append_fk_column(assoc_table, left_table.name, nullable=False)
+            _append_fk_column(assoc_table, right_table.name, nullable=False)
+
+    if len(tables) >= 3 and random.random() < config.SCHEMA_HUB_TABLE_PROB:
+        _add_hub_shape(tables)
+
+    if len(tables) >= 2 and random.random() < config.SCHEMA_BACKLINK_FK_PROB:
+        _add_backlink_shape(tables)
+
+    _ensure_join_backbone(tables)
+
+
+def _append_fk_column(
+    table: TableSchema,
+    ref_table_name: str,
+    base_name: Optional[str] = None,
+    nullable: bool = False,
+) -> None:
+    col_name = _unique_col_name(table.columns, base_name or f"{ref_table_name}_id")
+    if any(fk.src_col == col_name and fk.ref_table == ref_table_name for fk in table.fks):
+        return
+
+    table.columns.append(
+        Column(
+            name=col_name,
+            col_type=ColType.INT,
+            nullable=nullable,
+        )
+    )
+    table.fks.append(
+        ForeignKey(
+            src_table=table.name,
+            src_col=col_name,
+            ref_table=ref_table_name,
+            ref_col="id",
+        )
+    )
+
+
+def _add_hub_shape(tables: List[TableSchema]) -> None:
+    hub = random.choice(tables)
+    spokes = [table for table in tables if table.name != hub.name]
+    if len(spokes) < 2:
+        return
+    sample_size = random.randint(2, min(3, len(spokes)))
+    for spoke in random.sample(spokes, sample_size):
+        _append_fk_column(
+            spoke,
+            hub.name,
+            nullable=(random.random() < config.SCHEMA_NULLABLE_FK_PROB),
+        )
+
+
+def _add_backlink_shape(tables: List[TableSchema]) -> None:
+    src_table, ref_table = random.sample(tables, 2)
+    _append_fk_column(
+        src_table,
+        ref_table.name,
+        base_name=f"{ref_table.name}_peer_id",
+        nullable=(random.random() < config.SCHEMA_NULLABLE_FK_PROB),
+    )
+
+
+def _ensure_join_backbone(tables: List[TableSchema]) -> None:
+    if len(tables) < 3:
+        return
+
+    existing_pairs = {(fk.src_table, fk.ref_table) for table in tables for fk in table.fks}
+    for idx in range(1, len(tables)):
+        src = tables[idx]
+        ref = tables[idx - 1]
+        if (src.name, ref.name) in existing_pairs:
+            continue
+        _append_fk_column(
+            src,
+            ref.name,
+            base_name=f"{ref.name}_chain_id",
+            nullable=(random.random() < config.SCHEMA_NULLABLE_FK_PROB),
+        )
+        existing_pairs.add((src.name, ref.name))
+
+
+def _unique_col_name(columns: List[Column], base_name: str) -> str:
+    existing = {col.name for col in columns}
+    if base_name not in existing:
+        return base_name
+    suffix = 2
+    while f"{base_name}_{suffix}" in existing:
+        suffix += 1
+    return f"{base_name}_{suffix}"
 
 
 # ---------------------------------------------------------------------------

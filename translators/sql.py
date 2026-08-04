@@ -142,9 +142,11 @@ def _build_parts(node: QueryNode) -> QueryParts:
             elif field in agg_select_map:
                 exprs.append(agg_select_map[field])
             else:
-                exprs.append(
-                    _translate_expr(field, agg_expr_map=agg_expr_map, prefer_field=True)
-                )
+                expr = _translate_expr(field, agg_expr_map=agg_expr_map, prefer_field=True)
+                if isinstance(field, str):
+                    exprs.append(f"{expr} AS `{_project_output_name(field)}`")
+                else:
+                    exprs.append(expr)
         parts.select_clause = f"SELECT {', '.join(exprs)}"
         return parts
     if isinstance(node, Distinct):
@@ -427,6 +429,13 @@ def _query_has_limit_offset(node: QueryNode) -> bool:
 
 def _derived_output_name(field_name: str) -> str:
     return field_name.split(".", 1)[1] if "." in field_name else field_name
+
+
+def _project_output_name(field_name: str) -> str:
+    if "." in field_name:
+        table_alias, col_name = field_name.split(".", 1)
+        return f"{table_alias}_{col_name}"
+    return field_name
 
 
 def _quote_field(field_name: str) -> str:

@@ -122,7 +122,90 @@ def _generate_random(
             profile=profile,
         )
         data[table_name] = rows
+
+    _reinforce_anchor_rows(schema, data, stress_mode=stress_mode, profile=profile)
     return data
+
+
+def _reinforce_anchor_rows(
+    schema: Schema,
+    data: TableData,
+    stress_mode: str,
+    profile: Optional[dict],
+) -> None:
+    """
+    Make sure the random dataset contains a small, deterministic "anchor"
+    region that is easy for JOIN / GROUP BY / threshold predicates to hit.
+
+    This does not replace the random rows; it only nudges the first one or two
+    rows of each table so the run is less likely to be dominated by empty
+    results caused by unlucky FK / predicate combinations.
+    """
+    if not data:
+        return
+
+    for table in schema.tables:
+        rows = data.get(table.name, [])
+        if not rows:
+            continue
+        _rewrite_anchor_row(
+            table,
+            rows[0],
+            data,
+            stress_mode=stress_mode,
+            profile=profile,
+            anchor_index=0,
+        )
+        if len(rows) >= 2:
+            _rewrite_anchor_row(
+                table,
+                rows[1],
+                data,
+                stress_mode=stress_mode,
+                profile=profile,
+                anchor_index=1,
+            )
+
+
+def _rewrite_anchor_row(
+    table: TableSchema,
+    row: Row,
+    data: TableData,
+    stress_mode: str,
+    profile: Optional[dict],
+    anchor_index: int,
+) -> None:
+    for col in table.columns:
+        if col.is_pk:
+            continue
+
+        if _is_fk_col(col.name, table):
+            ref_table = _get_fk_ref_table(col.name, table)
+            parent_rows = data.get(ref_table or "", [])
+            if not parent_rows:
+                continue
+            parent_row = parent_rows[min(anchor_index, len(parent_rows) - 1)]
+            row[col.name] = parent_row["id"]
+            continue
+
+        if (
+            col.nullable
+            and profile is not None
+            and col.name in profile["nullable_short_names"]
+            and anchor_index == 1
+            and stress_mode in ("null_heavy", "groupby_heavy", "subquery_heavy", "combo_heavy")
+        ):
+            row[col.name] = None
+            continue
+
+        hot_values = _hot_values_for_column(col, profile)
+        if hot_values:
+            pick_index = min(anchor_index, len(hot_values) - 1)
+            row[col.name] = hot_values[pick_index]
+            continue
+
+        edge_values = _edge_values_for_column(col, profile)
+        row[col.name] = edge_values[min(anchor_index, len(edge_values) - 1)]
 
 
 def _generate_table_rows(
@@ -227,6 +310,24 @@ def _plan_row_budget(
 
     if stress_mode in ("join_heavy", "null_heavy"):
         adversarial_rows += 2
+        extra_random_rows += 2
+    elif stress_mode in ("derived_heavy", "window_heavy", "subquery_heavy", "combo_heavy"):
+        adversarial_rows += 2
+        edge_rows += 1
+        extra_random_rows += 1
+    elif stress_mode in (
+        "relationship_heavy",
+        "relationship_orderby_heavy",
+        "entity_heavy",
+        "entity_dedup_heavy",
+        "distinct_entity_heavy",
+        "limit_joined_entity_heavy",
+        "loader_heavy",
+        "loader_strategy_heavy",
+        "orm_combo_heavy",
+    ):
+        adversarial_rows += 2
+        edge_rows += 1
         extra_random_rows += 2
     elif stress_mode == "groupby_heavy":
         adversarial_rows += 1
@@ -362,10 +463,19 @@ def _choose_fk_value(
     stress_mode: str,
     profile: Optional[dict],
     row_kind: str,
-) -> int:
+) -> Any:
     ref_table_name = _get_fk_ref_table(col.name, table)
     parent_rows = existing_data.get(ref_table_name or "", [])
     parent_ids = [row["id"] for row in parent_rows]
+
+    if col.nullable:
+        null_prob = 0.08
+        if row_kind == "adversarial":
+            null_prob = 0.22
+        elif row_kind == "edge":
+            null_prob = 0.35
+        if random.random() < null_prob:
+            return None
 
     if not parent_ids:
         return row_id
@@ -374,7 +484,17 @@ def _choose_fk_value(
         row_kind in ("adversarial", "edge")
         and profile is not None
         and table.name in profile["left_join_right_tables"]
-        and stress_mode in ("join_heavy", "null_heavy", "groupby_heavy")
+        and stress_mode in (
+            "join_heavy",
+            "null_heavy",
+            "groupby_heavy",
+            "relationship_heavy",
+            "relationship_orderby_heavy",
+            "loader_heavy",
+            "loader_strategy_heavy",
+            "limit_joined_entity_heavy",
+            "orm_combo_heavy",
+        )
     )
 
     if allow_orphan and random.random() < 0.55:
@@ -382,9 +502,17 @@ def _choose_fk_value(
 
     if row_kind in ("core", "adversarial") and stress_mode in (
         "join_heavy",
+        "relationship_heavy",
+        "relationship_orderby_heavy",
         "groupby_heavy",
         "duplicate_column_heavy",
         "null_heavy",
+        "entity_dedup_heavy",
+        "distinct_entity_heavy",
+        "limit_joined_entity_heavy",
+        "loader_heavy",
+        "loader_strategy_heavy",
+        "orm_combo_heavy",
     ):
         hot_ids = parent_ids[: min(3, len(parent_ids))]
         if hot_ids and random.random() < 0.8:
@@ -432,6 +560,8 @@ def _random_value(
         reuse_prob = 0.55
         if stress_mode in ("groupby_heavy", "join_heavy", "duplicate_column_heavy"):
             reuse_prob = 0.8
+        elif stress_mode in ("derived_heavy", "window_heavy", "subquery_heavy", "combo_heavy"):
+            reuse_prob = 0.75
         elif stress_mode == "null_heavy":
             reuse_prob = 0.7
         if row_kind == "adversarial":
@@ -483,6 +613,20 @@ def _build_value_pool(
 
     pool_size = 2
     if stress_mode in ("groupby_heavy", "join_heavy", "duplicate_column_heavy"):
+        pool_size = 4
+    elif stress_mode in ("derived_heavy", "window_heavy", "subquery_heavy", "combo_heavy"):
+        pool_size = 4
+    elif stress_mode in (
+        "relationship_heavy",
+        "relationship_orderby_heavy",
+        "entity_heavy",
+        "entity_dedup_heavy",
+        "distinct_entity_heavy",
+        "limit_joined_entity_heavy",
+        "loader_heavy",
+        "loader_strategy_heavy",
+        "orm_combo_heavy",
+    ):
         pool_size = 4
     elif stress_mode == "null_heavy":
         pool_size = 3
